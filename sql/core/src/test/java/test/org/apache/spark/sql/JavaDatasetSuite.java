@@ -279,7 +279,7 @@ public class JavaDatasetSuite implements Serializable {
     Assert.assertTrue(prevState.isUpdated());
     Assert.assertFalse(prevState.isRemoved());
     Assert.assertTrue(prevState.exists());
-    Assert.assertEquals(new Integer(9), prevState.get());
+    Assert.assertEquals(Integer.valueOf(9), prevState.get());
     Assert.assertEquals(0L, prevState.getCurrentProcessingTimeMs());
     Assert.assertEquals(1000L, prevState.getCurrentWatermarkMs());
     Assert.assertEquals(Optional.of(1500L), prevState.getTimeoutTimestampMs());
@@ -289,7 +289,7 @@ public class JavaDatasetSuite implements Serializable {
     Assert.assertTrue(prevState.isUpdated());
     Assert.assertFalse(prevState.isRemoved());
     Assert.assertTrue(prevState.exists());
-    Assert.assertEquals(new Integer(18), prevState.get());
+    Assert.assertEquals(Integer.valueOf(18), prevState.get());
 
     prevState = TestGroupState.create(
       Optional.of(9), GroupStateTimeout.EventTimeTimeout(), 0L, Optional.of(1000L), true);
@@ -604,14 +604,6 @@ public class JavaDatasetSuite implements Serializable {
     List<Tuple2<LocalDate, Instant>> data =
       Arrays.asList(new Tuple2<>(LocalDate.ofEpochDay(0), Instant.ofEpochSecond(0)));
     Dataset<Tuple2<LocalDate, Instant>> ds = spark.createDataset(data, encoder);
-    Assert.assertEquals(data, ds.collectAsList());
-  }
-
-  @Test
-  public void testLocalDateTimeEncoder() {
-    Encoder<LocalDateTime> encoder = Encoders.LOCALDATETIME();
-    List<LocalDateTime> data = Arrays.asList(LocalDateTime.of(1, 1, 1, 1, 1));
-    Dataset<LocalDateTime> ds = spark.createDataset(data, encoder);
     Assert.assertEquals(data, ds.collectAsList());
   }
 

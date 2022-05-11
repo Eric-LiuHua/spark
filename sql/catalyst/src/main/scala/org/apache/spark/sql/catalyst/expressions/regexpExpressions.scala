@@ -30,7 +30,8 @@ import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.{TypeCheckFailure, TypeCheckSuccess}
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
-import org.apache.spark.sql.catalyst.trees.TreePattern.{LIKE_FAMLIY, TreePattern}
+import org.apache.spark.sql.catalyst.trees.BinaryLike
+import org.apache.spark.sql.catalyst.trees.TreePattern.{LIKE_FAMLIY, REGEXP_EXTRACT_FAMILY, REGEXP_REPLACE, TreePattern}
 import org.apache.spark.sql.catalyst.util.{GenericArrayData, StringUtils}
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types._
@@ -186,6 +187,74 @@ case class Like(left: Expression, right: Expression, escapeChar: Char)
 
   override protected def withNewChildrenInternal(newLeft: Expression, newRight: Expression): Like =
     copy(left = newLeft, right = newRight)
+}
+
+// scalastyle:off line.contains.tab
+/**
+ * Simple RegEx case-insensitive pattern matching function
+ */
+@ExpressionDescription(
+  usage = "str _FUNC_ pattern[ ESCAPE escape] - Returns true if str matches `pattern` with " +
+    "`escape` case-insensitively, null if any arguments are null, false otherwise.",
+  arguments = """
+    Arguments:
+      * str - a string expression
+      * pattern - a string expression. The pattern is a string which is matched literally and
+          case-insensitively, with exception to the following special symbols:
+
+          _ matches any one character in the input (similar to . in posix regular expressions)
+
+          % matches zero or more characters in the input (similar to .* in posix regular
+          expressions)
+
+          Since Spark 2.0, string literals are unescaped in our SQL parser. For example, in order
+          to match "\abc", the pattern should be "\\abc".
+
+          When SQL config 'spark.sql.parser.escapedStringLiterals' is enabled, it falls back
+          to Spark 1.6 behavior regarding string literal parsing. For example, if the config is
+          enabled, the pattern to match "\abc" should be "\abc".
+      * escape - an character added since Spark 3.0. The default escape character is the '\'.
+          If an escape character precedes a special symbol or another escape character, the
+          following character is matched literally. It is invalid to escape any other character.
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_('Spark', '_Park');
+      true
+      > SET spark.sql.parser.escapedStringLiterals=true;
+      spark.sql.parser.escapedStringLiterals	true
+      > SELECT '%SystemDrive%\Users\John' _FUNC_ '\%SystemDrive\%\\users%';
+      true
+      > SET spark.sql.parser.escapedStringLiterals=false;
+      spark.sql.parser.escapedStringLiterals	false
+      > SELECT '%SystemDrive%\\USERS\\John' _FUNC_ '\%SystemDrive\%\\\\Users%';
+      true
+      > SELECT '%SystemDrive%/Users/John' _FUNC_ '/%SYSTEMDrive/%//Users%' ESCAPE '/';
+      true
+  """,
+  note = """
+    Use RLIKE to match with standard regular expressions.
+  """,
+  since = "3.3.0",
+  group = "predicate_funcs")
+// scalastyle:on line.contains.tab
+case class ILike(
+    left: Expression,
+    right: Expression,
+    escapeChar: Char) extends RuntimeReplaceable
+  with ImplicitCastInputTypes with BinaryLike[Expression] {
+
+  override lazy val replacement: Expression = Like(Lower(left), Lower(right), escapeChar)
+
+  def this(left: Expression, right: Expression) =
+    this(left, right, '\\')
+
+  override def inputTypes: Seq[AbstractDataType] = Seq(StringType, StringType)
+
+  override protected def withNewChildrenInternal(
+      newLeft: Expression, newRight: Expression): Expression = {
+    copy(left = newLeft, right = newRight)
+  }
 }
 
 sealed abstract class MultiLikeBase
@@ -463,7 +532,7 @@ case class RLike(left: Expression, right: Expression) extends StringRegexExpress
 case class StringSplit(str: Expression, regex: Expression, limit: Expression)
   extends TernaryExpression with ImplicitCastInputTypes with NullIntolerant {
 
-  override def dataType: DataType = ArrayType(StringType)
+  override def dataType: DataType = ArrayType(StringType, containsNull = false)
   override def inputTypes: Seq[DataType] = Seq(StringType, StringType, IntegerType)
   override def first: Expression = str
   override def second: Expression = regex
@@ -558,6 +627,7 @@ case class RegExpReplace(subject: Expression, regexp: Expression, rep: Expressio
   @transient private var lastReplacementInUTF8: UTF8String = _
   // result buffer write by Matcher
   @transient private lazy val result: StringBuffer = new StringBuffer
+  final override val nodePatterns: Seq[TreePattern] = Seq(REGEXP_REPLACE)
 
   override def nullSafeEval(s: Any, p: Any, r: Any, i: Any): Any = {
     if (!p.equals(lastRegex)) {
@@ -572,7 +642,7 @@ case class RegExpReplace(subject: Expression, regexp: Expression, rep: Expressio
     }
     val source = s.toString()
     val position = i.asInstanceOf[Int] - 1
-    if (position < source.length) {
+    if (position == 0 || position < source.length) {
       val m = pattern.matcher(source)
       m.region(position, source.length)
       result.delete(0, result.length())
@@ -626,7 +696,7 @@ case class RegExpReplace(subject: Expression, regexp: Expression, rep: Expressio
       }
       String $source = $subject.toString();
       int $position = $pos - 1;
-      if ($position < $source.length()) {
+      if ($position == 0 || $position < $source.length()) {
         $classNameStringBuffer $termResult = new $classNameStringBuffer();
         java.util.regex.Matcher $matcher = $termPattern.matcher($source);
         $matcher.region($position, $source.length());
@@ -681,6 +751,8 @@ abstract class RegExpExtractBase
   @transient private var lastRegex: UTF8String = _
   // last regex pattern, we cache it for performance concern
   @transient private var pattern: Pattern = _
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(REGEXP_EXTRACT_FAMILY)
 
   override def inputTypes: Seq[AbstractDataType] = Seq(StringType, StringType, IntegerType)
   override def first: Expression = subject

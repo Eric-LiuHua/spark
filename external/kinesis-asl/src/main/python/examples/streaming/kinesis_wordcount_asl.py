@@ -50,9 +50,9 @@
       Credential profiles file - default location (~/.aws/credentials) shared by all AWS SDKs
       Instance profile credentials - delivered through the Amazon EC2 metadata service
   For more information, see
-      http://docs.aws.amazon.com/AWSSdkDocsJava/latest/DeveloperGuide/credentials.html
+      https://docs.aws.amazon.com/AWSSdkDocsJava/latest/DeveloperGuide/credentials.html
 
-  See http://spark.apache.org/docs/latest/streaming-kinesis-integration.html for more details on
+  See https://spark.apache.org/docs/latest/streaming-kinesis-integration.html for more details on
   the Kinesis Spark Streaming integration.
 """
 import sys
@@ -75,7 +75,7 @@ if __name__ == "__main__":
         ssc, appName, streamName, endpointUrl, regionName, InitialPositionInStream.LATEST, 2)
     counts = lines.flatMap(lambda line: line.split(" ")) \
         .map(lambda word: (word, 1)) \
-        .reduceByKey(lambda a, b: a+b)
+        .reduceByKey(lambda a, b: a + b)
     counts.pprint()
 
     ssc.start()

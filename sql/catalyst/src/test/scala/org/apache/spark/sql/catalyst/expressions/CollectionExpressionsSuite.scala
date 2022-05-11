@@ -66,7 +66,9 @@ class CollectionExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper
   }
 
   test("Array and Map Size - legacy") {
-    withSQLConf(SQLConf.LEGACY_SIZE_OF_NULL.key -> "true") {
+    withSQLConf(
+      SQLConf.LEGACY_SIZE_OF_NULL.key -> "true",
+      SQLConf.ANSI_ENABLED.key -> "false") {
       testSize(sizeOfNull = -1)
     }
   }
@@ -94,6 +96,15 @@ class CollectionExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper
     checkEvaluation(MapValues(m1), Seq())
     checkEvaluation(MapKeys(m2), null)
     checkEvaluation(MapValues(m2), null)
+  }
+
+  test("MapContainsKey") {
+    val m0 = Literal.create(Map("a" -> "1", "b" -> "2"), MapType(StringType, StringType))
+    val m1 = Literal.create(null, MapType(StringType, StringType))
+    checkEvaluation(ArrayContains(MapKeys(m0), Literal("a")), true)
+    checkEvaluation(ArrayContains(MapKeys(m0), Literal("c")), false)
+    checkEvaluation(ArrayContains(MapKeys(m0), Literal(null, StringType)), null)
+    checkEvaluation(ArrayContains(MapKeys(m1), Literal("a")), null)
   }
 
   test("MapEntries") {
@@ -1428,8 +1439,10 @@ class CollectionExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper
       checkEvaluation(ElementAt(a0, Literal(0)), null)
     }.getMessage.contains("SQL array indices start at 1")
     intercept[Exception] { checkEvaluation(ElementAt(a0, Literal(1.1)), null) }
-    checkEvaluation(ElementAt(a0, Literal(4)), null)
-    checkEvaluation(ElementAt(a0, Literal(-4)), null)
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
+      checkEvaluation(ElementAt(a0, Literal(4)), null)
+      checkEvaluation(ElementAt(a0, Literal(-4)), null)
+    }
 
     checkEvaluation(ElementAt(a0, Literal(1)), 1)
     checkEvaluation(ElementAt(a0, Literal(2)), 2)
@@ -1455,9 +1468,10 @@ class CollectionExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper
 
     assert(ElementAt(m0, Literal(1.0)).checkInputDataTypes().isFailure)
 
-    checkEvaluation(ElementAt(m0, Literal("d")), null)
-
-    checkEvaluation(ElementAt(m1, Literal("a")), null)
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
+      checkEvaluation(ElementAt(m0, Literal("d")), null)
+      checkEvaluation(ElementAt(m1, Literal("a")), null)
+    }
 
     checkEvaluation(ElementAt(m0, Literal("a")), "1")
     checkEvaluation(ElementAt(m0, Literal("b")), "2")
@@ -1471,9 +1485,10 @@ class CollectionExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper
       MapType(BinaryType, StringType))
     val mb1 = Literal.create(Map[Array[Byte], String](), MapType(BinaryType, StringType))
 
-    checkEvaluation(ElementAt(mb0, Literal(Array[Byte](1, 2, 3))), null)
-
-    checkEvaluation(ElementAt(mb1, Literal(Array[Byte](1, 2))), null)
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
+      checkEvaluation(ElementAt(mb0, Literal(Array[Byte](1, 2, 3))), null)
+      checkEvaluation(ElementAt(mb1, Literal(Array[Byte](1, 2))), null)
+    }
     checkEvaluation(ElementAt(mb0, Literal(Array[Byte](2, 1), BinaryType)), "2")
     checkEvaluation(ElementAt(mb0, Literal(Array[Byte](3, 4))), null)
   }
@@ -2249,13 +2264,31 @@ class CollectionExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper
       Seq(Date.valueOf("2018-01-01")))
   }
 
+  test("SPARK-36639: Start and end equal in month range with a negative step") {
+    checkEvaluation(new Sequence(
+      Literal(Date.valueOf("2018-01-01")),
+      Literal(Date.valueOf("2018-01-01")),
+      Literal(stringToInterval("interval -1 day"))),
+      Seq(Date.valueOf("2018-01-01")))
+    checkEvaluation(new Sequence(
+      Literal(Date.valueOf("2018-01-01")),
+      Literal(Date.valueOf("2018-01-01")),
+      Literal(stringToInterval("interval -1 month"))),
+      Seq(Date.valueOf("2018-01-01")))
+    checkEvaluation(new Sequence(
+      Literal(Date.valueOf("2018-01-01")),
+      Literal(Date.valueOf("2018-01-01")),
+      Literal(stringToInterval("interval -1 year"))),
+      Seq(Date.valueOf("2018-01-01")))
+  }
+
   test("SPARK-33386: element_at ArrayIndexOutOfBoundsException") {
     Seq(true, false).foreach { ansiEnabled =>
       withSQLConf(SQLConf.ANSI_ENABLED.key -> ansiEnabled.toString) {
         val array = Literal.create(Seq(1, 2, 3), ArrayType(IntegerType))
         var expr: Expression = ElementAt(array, Literal(5))
         if (ansiEnabled) {
-          val errMsg = "Invalid index: 5, numElements: 3"
+          val errMsg = "The index 5 is out of bounds. The array has 3 elements."
           checkExceptionInExpression[Exception](expr, errMsg)
         } else {
           checkEvaluation(expr, null)
@@ -2263,7 +2296,7 @@ class CollectionExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper
 
         expr = ElementAt(array, Literal(-5))
         if (ansiEnabled) {
-          val errMsg = "Invalid index: -5, numElements: 3"
+          val errMsg = "The index -5 is out of bounds. The array has 3 elements."
           checkExceptionInExpression[Exception](expr, errMsg)
         } else {
           checkEvaluation(expr, null)
@@ -2290,5 +2323,95 @@ class CollectionExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper
         }
       }
     }
+  }
+
+  test("SPARK-36702: ArrayUnion should handle duplicated Double.NaN and Float.Nan") {
+    checkEvaluation(ArrayUnion(
+      Literal.apply(Array(Double.NaN, Double.NaN)), Literal.apply(Array(1d))),
+      Seq(Double.NaN, 1d))
+    checkEvaluation(ArrayUnion(
+      Literal.create(Seq(Double.NaN, null), ArrayType(DoubleType)),
+      Literal.create(Seq(Double.NaN, null, 1d), ArrayType(DoubleType))),
+      Seq(Double.NaN, null, 1d))
+    checkEvaluation(ArrayUnion(
+      Literal.apply(Array(Float.NaN, Float.NaN)), Literal.apply(Array(1f))),
+      Seq(Float.NaN, 1f))
+    checkEvaluation(ArrayUnion(
+      Literal.create(Seq(Float.NaN, null), ArrayType(FloatType)),
+      Literal.create(Seq(Float.NaN, null, 1f), ArrayType(FloatType))),
+      Seq(Float.NaN, null, 1f))
+  }
+
+  test("SPARK-36753: ArrayExcept should handle duplicated Double.NaN and Float.Nan") {
+    checkEvaluation(ArrayExcept(
+      Literal.apply(Array(Double.NaN, 1d)), Literal.apply(Array(Double.NaN))),
+      Seq(1d))
+    checkEvaluation(ArrayExcept(
+      Literal.create(Seq(null, Double.NaN, null, 1d), ArrayType(DoubleType)),
+      Literal.create(Seq(Double.NaN, null), ArrayType(DoubleType))),
+      Seq(1d))
+    checkEvaluation(ArrayExcept(
+      Literal.apply(Array(Float.NaN, 1f)), Literal.apply(Array(Float.NaN))),
+      Seq(1f))
+    checkEvaluation(ArrayExcept(
+      Literal.create(Seq(null, Float.NaN, null, 1f), ArrayType(FloatType)),
+      Literal.create(Seq(Float.NaN, null), ArrayType(FloatType))),
+      Seq(1f))
+  }
+
+  test("SPARK-36754: ArrayIntersect should handle duplicated Double.NaN and Float.Nan") {
+    checkEvaluation(ArrayIntersect(
+      Literal.apply(Array(Double.NaN, 1d)), Literal.apply(Array(Double.NaN, 1d, 2d))),
+      Seq(Double.NaN, 1d))
+    checkEvaluation(ArrayIntersect(
+      Literal.create(Seq(null, Double.NaN, null, 1d), ArrayType(DoubleType)),
+      Literal.create(Seq(null, Double.NaN, null), ArrayType(DoubleType))),
+      Seq(null, Double.NaN))
+    checkEvaluation(ArrayIntersect(
+      Literal.apply(Array(Float.NaN, 1f)), Literal.apply(Array(Float.NaN, 1f, 2f))),
+      Seq(Float.NaN, 1f))
+    checkEvaluation(ArrayIntersect(
+      Literal.create(Seq(null, Float.NaN, null, 1f), ArrayType(FloatType)),
+      Literal.create(Seq(null, Float.NaN, null), ArrayType(FloatType))),
+      Seq(null, Float.NaN))
+  }
+
+  test("SPARK-36741: ArrayDistinct should handle duplicated Double.NaN and Float.Nan") {
+    checkEvaluation(ArrayDistinct(
+      Literal.create(Seq(Double.NaN, Double.NaN, null, null, 1d, 1d), ArrayType(DoubleType))),
+      Seq(Double.NaN, null, 1d))
+    checkEvaluation(ArrayDistinct(
+      Literal.create(Seq(Float.NaN, Float.NaN, null, null, 1f, 1f), ArrayType(FloatType))),
+      Seq(Float.NaN, null, 1f))
+  }
+
+  test("SPARK-36755: ArraysOverlap hould handle duplicated Double.NaN and Float.Nan") {
+    checkEvaluation(ArraysOverlap(
+      Literal.apply(Array(Double.NaN, 1d)), Literal.apply(Array(Double.NaN))), true)
+    checkEvaluation(ArraysOverlap(
+      Literal.create(Seq(Double.NaN, null), ArrayType(DoubleType)),
+      Literal.create(Seq(Double.NaN, null, 1d), ArrayType(DoubleType))), true)
+    checkEvaluation(ArraysOverlap(
+      Literal.apply(Array(Float.NaN)), Literal.apply(Array(Float.NaN, 1f))), true)
+    checkEvaluation(ArraysOverlap(
+      Literal.create(Seq(Float.NaN, null), ArrayType(FloatType)),
+      Literal.create(Seq(Float.NaN, null, 1f), ArrayType(FloatType))), true)
+  }
+
+  test("SPARK-36740: ArrayMin/ArrayMax/SortArray should handle NaN greater then non-NaN value") {
+    // ArrayMin
+    checkEvaluation(ArrayMin(
+      Literal.create(Seq(Double.NaN, 1d, 2d), ArrayType(DoubleType))), 1d)
+    checkEvaluation(ArrayMin(
+      Literal.create(Seq(Double.NaN, 1d, 2d, null), ArrayType(DoubleType))), 1d)
+    // ArrayMax
+    checkEvaluation(ArrayMax(
+      Literal.create(Seq(Double.NaN, 1d, 2d), ArrayType(DoubleType))), Double.NaN)
+    checkEvaluation(ArrayMax(
+      Literal.create(Seq(Double.NaN, 1d, 2d, null), ArrayType(DoubleType))), Double.NaN)
+    // SortArray
+    checkEvaluation(new SortArray(
+      Literal.create(Seq(Double.NaN, 1d, 2d, null), ArrayType(DoubleType))),
+      Seq(null, 1d, 2d, Double.NaN))
   }
 }

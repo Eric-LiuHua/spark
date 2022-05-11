@@ -20,8 +20,6 @@ package org.apache.spark.sql.streaming.test
 import java.io.File
 import java.util
 
-import scala.collection.JavaConverters._
-
 import org.scalatest.BeforeAndAfter
 
 import org.apache.spark.sql.{AnalysisException, Row}
@@ -164,11 +162,9 @@ class DataStreamTableAPISuite extends StreamTest with BeforeAndAfter {
         spark.sql(s"CREATE TABLE $tblName (data int) USING $v2Source")
 
         // Check the StreamingRelationV2 has been replaced by StreamingRelation
-        val plan = spark.readStream.option("path", tempDir.getCanonicalPath).table(tblName)
-          .queryExecution.analyzed.collectFirst {
-            case d: StreamingRelationV2 => d
-          }
-        assert(plan.isEmpty)
+        val exists = spark.readStream.option("path", tempDir.getCanonicalPath).table(tblName)
+          .queryExecution.analyzed.exists(_.isInstanceOf[StreamingRelationV2])
+        assert(!exists)
       }
     }
   }
@@ -412,7 +408,7 @@ class InMemoryStreamTable(override val name: String) extends Table with Supports
   override def schema(): StructType = stream.fullSchema()
 
   override def capabilities(): util.Set[TableCapability] = {
-    Set(TableCapability.MICRO_BATCH_READ, TableCapability.CONTINUOUS_READ).asJava
+    util.EnumSet.of(TableCapability.MICRO_BATCH_READ, TableCapability.CONTINUOUS_READ)
   }
 
   override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
@@ -423,7 +419,8 @@ class InMemoryStreamTable(override val name: String) extends Table with Supports
 class NonStreamV2Table(override val name: String)
     extends Table with SupportsRead with V2TableWithV1Fallback {
   override def schema(): StructType = StructType(Nil)
-  override def capabilities(): util.Set[TableCapability] = Set(TableCapability.BATCH_READ).asJava
+  override def capabilities(): util.Set[TableCapability] =
+    util.EnumSet.of(TableCapability.BATCH_READ)
   override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = new FakeScanBuilder
 
   override def v1Table: CatalogTable = {

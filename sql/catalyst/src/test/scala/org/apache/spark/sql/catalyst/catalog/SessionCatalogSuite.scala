@@ -1574,6 +1574,25 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
     }
   }
 
+  test("SPARK-38974: list functions in database") {
+    withEmptyCatalog { catalog =>
+      val tmpFunc = newFunc("func1", None)
+      val func1 = newFunc("func1", Some("default"))
+      val func2 = newFunc("func2", Some("db1"))
+      val builder = (e: Seq[Expression]) => e.head
+      catalog.createDatabase(newDb("db1"), ignoreIfExists = false)
+      catalog.registerFunction(tmpFunc, overrideIfExists = false, functionBuilder = Some(builder))
+      catalog.createFunction(func1, ignoreIfExists = false)
+      catalog.createFunction(func2, ignoreIfExists = false)
+      // Load func2 into the function registry.
+      catalog.registerFunction(func2, overrideIfExists = false, functionBuilder = Some(builder))
+      // Should not include func2.
+      assert(catalog.listFunctions("default", "*").map(_._1).toSet ==
+        Set(FunctionIdentifier("func1"), FunctionIdentifier("func1", Some("default")))
+      )
+    }
+  }
+
   test("copy SessionCatalog state - temp views") {
     withEmptyCatalog { original =>
       val tempTable1 = Range(1, 10, 1, 10)
@@ -1620,36 +1639,6 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
       assert(original.getCurrentDatabase == db1)
       original.setCurrentDatabase(db3)
       assert(clone.getCurrentDatabase == db2)
-    }
-  }
-
-  test("SPARK-19737: detect undefined functions without triggering relation resolution") {
-    import org.apache.spark.sql.catalyst.dsl.plans._
-
-    Seq(true, false) foreach { caseSensitive =>
-      withSQLConf(SQLConf.CASE_SENSITIVE.key -> caseSensitive.toString) {
-        val catalog = new SessionCatalog(newBasicCatalog(), new SimpleFunctionRegistry)
-        catalog.setCurrentDatabase("db1")
-        try {
-          val analyzer = new Analyzer(catalog)
-
-          // The analyzer should report the undefined function
-          // rather than the undefined table first.
-          val cause = intercept[AnalysisException] {
-            analyzer.execute(
-              UnresolvedRelation(TableIdentifier("undefined_table")).select(
-                UnresolvedFunction("undefined_fn", Nil, isDistinct = false)
-              )
-            )
-          }
-
-          assert(cause.getMessage.contains("Undefined function: 'undefined_fn'"))
-          // SPARK-21318: the error message should contains the current database name
-          assert(cause.getMessage.contains("db1"))
-        } finally {
-          catalog.reset()
-        }
-      }
     }
   }
 

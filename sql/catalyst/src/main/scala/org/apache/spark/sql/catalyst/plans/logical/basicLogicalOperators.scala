@@ -22,7 +22,7 @@ import org.apache.spark.sql.catalyst.analysis.{AnsiTypeCoercion, MultiInstanceRe
 import org.apache.spark.sql.catalyst.catalog.{CatalogStorageFormat, CatalogTable}
 import org.apache.spark.sql.catalyst.catalog.CatalogTable.VIEW_STORING_ANALYZED_PLAN
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, TypedImperativeAggregate}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
@@ -277,11 +277,18 @@ case class Union(
   assert(!allowMissingCol || byName, "`allowMissingCol` can be true only if `byName` is true.")
 
   override def maxRows: Option[Long] = {
-    if (children.exists(_.maxRows.isEmpty)) {
-      None
-    } else {
-      Some(children.flatMap(_.maxRows).sum)
+    var sum = BigInt(0)
+    children.foreach { child =>
+      if (child.maxRows.isDefined) {
+        sum += child.maxRows.get
+        if (!sum.isValidLong) {
+          return None
+        }
+      } else {
+        return None
+      }
     }
+    Some(sum.toLong)
   }
 
   final override val nodePatterns: Seq[TreePattern] = Seq(UNION)
@@ -290,11 +297,18 @@ case class Union(
    * Note the definition has assumption about how union is implemented physically.
    */
   override def maxRowsPerPartition: Option[Long] = {
-    if (children.exists(_.maxRowsPerPartition.isEmpty)) {
-      None
-    } else {
-      Some(children.flatMap(_.maxRowsPerPartition).sum)
+    var sum = BigInt(0)
+    children.foreach { child =>
+      if (child.maxRowsPerPartition.isDefined) {
+        sum += child.maxRowsPerPartition.get
+        if (!sum.isValidLong) {
+          return None
+        }
+      } else {
+        return None
+      }
     }
+    Some(sum.toLong)
   }
 
   def duplicateResolved: Boolean = {
@@ -307,7 +321,7 @@ case class Union(
     children.map(_.output).transpose.map { attrs =>
       val firstAttr = attrs.head
       val nullable = attrs.exists(_.nullable)
-      val newDt = attrs.map(_.dataType).reduce(StructType.merge)
+      val newDt = attrs.map(_.dataType).reduce(StructType.unionLikeMerge)
       if (firstAttr.dataType == newDt) {
         firstAttr.withNullability(nullable)
       } else {
@@ -327,7 +341,7 @@ case class Union(
         child.output.length == children.head.output.length &&
         // compare the data types with the first child
         child.output.zip(children.head.output).forall {
-          case (l, r) => l.dataType.sameType(r.dataType)
+          case (l, r) => DataType.equalsStructurally(l.dataType, r.dataType, true)
         })
     children.length > 1 && !(byName || allowMissingCol) && childrenResolved && allChildrenCompatible
   }
@@ -383,8 +397,16 @@ case class Join(
   override def maxRows: Option[Long] = {
     joinType match {
       case Inner | Cross | FullOuter | LeftOuter | RightOuter
-        if left.maxRows.isDefined && right.maxRows.isDefined =>
-        val maxRows = BigInt(left.maxRows.get) * BigInt(right.maxRows.get)
+          if left.maxRows.isDefined && right.maxRows.isDefined =>
+        val leftMaxRows = BigInt(left.maxRows.get)
+        val rightMaxRows = BigInt(right.maxRows.get)
+        val minRows = joinType match {
+          case LeftOuter => leftMaxRows
+          case RightOuter => rightMaxRows
+          case FullOuter => leftMaxRows + rightMaxRows
+          case _ => BigInt(0)
+        }
+        val maxRows = (leftMaxRows * rightMaxRows).max(minRows)
         if (maxRows.isValidLong) {
           Some(maxRows.toLong)
         } else {
@@ -615,7 +637,11 @@ object View {
  * @param cteRelations A sequence of pair (alias, the CTE definition) that this CTE defined
  *                     Each CTE can see the base tables and the previously defined CTEs only.
  */
-case class With(child: LogicalPlan, cteRelations: Seq[(String, SubqueryAlias)]) extends UnaryNode {
+case class UnresolvedWith(
+    child: LogicalPlan,
+    cteRelations: Seq[(String, SubqueryAlias)]) extends UnaryNode {
+  final override val nodePatterns: Seq[TreePattern] = Seq(UNRESOLVED_WITH)
+
   override def output: Seq[Attribute] = child.output
 
   override def simpleString(maxFields: Int): String = {
@@ -625,7 +651,90 @@ case class With(child: LogicalPlan, cteRelations: Seq[(String, SubqueryAlias)]) 
 
   override def innerChildren: Seq[LogicalPlan] = cteRelations.map(_._2)
 
-  override protected def withNewChildInternal(newChild: LogicalPlan): With = copy(child = newChild)
+  override protected def withNewChildInternal(newChild: LogicalPlan): UnresolvedWith =
+    copy(child = newChild)
+}
+
+/**
+ * A wrapper for CTE definition plan with a unique ID.
+ * @param child The CTE definition query plan.
+ * @param id    The unique ID for this CTE definition.
+ * @param originalPlanWithPredicates The original query plan before predicate pushdown and the
+ *                                   predicates that have been pushed down into `child`. This is
+ *                                   a temporary field used by optimization rules for CTE predicate
+ *                                   pushdown to help ensure rule idempotency.
+ * @param underSubquery If true, it means we don't need to add a shuffle for this CTE relation as
+ *                      subquery reuse will be applied to reuse CTE relation output.
+ */
+case class CTERelationDef(
+    child: LogicalPlan,
+    id: Long = CTERelationDef.newId,
+    originalPlanWithPredicates: Option[(LogicalPlan, Seq[Expression])] = None,
+    underSubquery: Boolean = false) extends UnaryNode {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(CTE)
+
+  override protected def withNewChildInternal(newChild: LogicalPlan): LogicalPlan =
+    copy(child = newChild)
+
+  override def output: Seq[Attribute] = if (resolved) child.output else Nil
+}
+
+object CTERelationDef {
+  private[sql] val curId = new java.util.concurrent.atomic.AtomicLong()
+  def newId: Long = curId.getAndIncrement()
+}
+
+/**
+ * Represents the relation of a CTE reference.
+ * @param cteId                The ID of the corresponding CTE definition.
+ * @param _resolved            Whether this reference is resolved.
+ * @param output               The output attributes of this CTE reference, which can be different
+ *                             from the output of its corresponding CTE definition after attribute
+ *                             de-duplication.
+ * @param statsOpt             The optional statistics inferred from the corresponding CTE
+ *                             definition.
+ */
+case class CTERelationRef(
+    cteId: Long,
+    _resolved: Boolean,
+    override val output: Seq[Attribute],
+    statsOpt: Option[Statistics] = None) extends LeafNode with MultiInstanceRelation {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(CTE)
+
+  override lazy val resolved: Boolean = _resolved
+
+  override def newInstance(): LogicalPlan = copy(output = output.map(_.newInstance()))
+
+  def withNewStats(statsOpt: Option[Statistics]): CTERelationRef = copy(statsOpt = statsOpt)
+
+  override def computeStats(): Statistics = statsOpt.getOrElse(Statistics(conf.defaultSizeInBytes))
+}
+
+/**
+ * The resolved version of [[UnresolvedWith]] with CTE referrences linked to CTE definitions
+ * through unique IDs instead of relation aliases.
+ *
+ * @param plan    The query plan.
+ * @param cteDefs The CTE definitions.
+ */
+case class WithCTE(plan: LogicalPlan, cteDefs: Seq[CTERelationDef]) extends LogicalPlan {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(CTE)
+
+  override def output: Seq[Attribute] = plan.output
+
+  override def children: Seq[LogicalPlan] = cteDefs :+ plan
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[LogicalPlan]): LogicalPlan = {
+    copy(plan = newChildren.last, cteDefs = newChildren.init.asInstanceOf[Seq[CTERelationDef]])
+  }
+
+  def withNewPlan(newPlan: LogicalPlan): WithCTE = {
+    withNewChildren(children.init :+ newPlan).asInstanceOf[WithCTE]
+  }
 }
 
 case class WithWindowDefinition(
@@ -892,7 +1001,7 @@ case class Aggregate(
   final override val nodePatterns : Seq[TreePattern] = Seq(AGGREGATE)
 
   override lazy val validConstraints: ExpressionSet = {
-    val nonAgg = aggregateExpressions.filter(_.find(_.isInstanceOf[AggregateExpression]).isEmpty)
+    val nonAgg = aggregateExpressions.filter(!_.exists(_.isInstanceOf[AggregateExpression]))
     getAllValidConstraints(nonAgg)
   }
 
@@ -901,7 +1010,30 @@ case class Aggregate(
 
   // Whether this Aggregate operator is group only. For example: SELECT a, a FROM t GROUP BY a
   private[sql] def groupOnly: Boolean = {
-    aggregateExpressions.forall(a => groupingExpressions.exists(g => a.semanticEquals(g)))
+    // aggregateExpressions can be empty through Dateset.agg,
+    // so we should also check groupingExpressions is non empty
+    groupingExpressions.nonEmpty && aggregateExpressions.map {
+      case Alias(child, _) => child
+      case e => e
+    }.forall(a => a.foldable || groupingExpressions.exists(g => a.semanticEquals(g)))
+  }
+}
+
+object Aggregate {
+  def isAggregateBufferMutable(schema: StructType): Boolean = {
+    schema.forall(f => UnsafeRow.isMutable(f.dataType))
+  }
+
+  def supportsHashAggregate(aggregateBufferAttributes: Seq[Attribute]): Boolean = {
+    val aggregationBufferSchema = StructType.fromAttributes(aggregateBufferAttributes)
+    isAggregateBufferMutable(aggregationBufferSchema)
+  }
+
+  def supportsObjectHashAggregate(aggregateExpressions: Seq[AggregateExpression]): Boolean = {
+    aggregateExpressions.map(_.aggregateFunction).exists {
+      case _: TypedImperativeAggregate[_] => true
+      case _ => false
+    }
   }
 }
 
@@ -1258,7 +1390,11 @@ case class Sample(
       s"Sampling fraction ($fraction) must be on interval [0, 1] without replacement")
   }
 
-  override def maxRows: Option[Long] = child.maxRows
+  override def maxRows: Option[Long] = {
+    // when withReplacement is true, PoissonSampler is applied in SampleExec,
+    // which may output more rows than child.maxRows.
+    if (withReplacement) None else child.maxRows
+  }
   override def output: Seq[Attribute] = child.output
 
   override protected def withNewChildInternal(newChild: LogicalPlan): Sample =
@@ -1373,14 +1509,19 @@ object RepartitionByExpression {
  */
 case class RebalancePartitions(
     partitionExpressions: Seq[Expression],
-    child: LogicalPlan) extends UnaryNode {
+    child: LogicalPlan,
+    initialNumPartitionOpt: Option[Int] = None) extends UnaryNode {
   override def maxRows: Option[Long] = child.maxRows
   override def output: Seq[Attribute] = child.output
+  override val nodePatterns: Seq[TreePattern] = Seq(REBALANCE_PARTITIONS)
 
-  def partitioning: Partitioning = if (partitionExpressions.isEmpty) {
-    RoundRobinPartitioning(conf.numShufflePartitions)
-  } else {
-    HashPartitioning(partitionExpressions, conf.numShufflePartitions)
+  def partitioning: Partitioning = {
+    val initialNumPartitions = initialNumPartitionOpt.getOrElse(conf.numShufflePartitions)
+    if (partitionExpressions.isEmpty) {
+      RoundRobinPartitioning(initialNumPartitions)
+    } else {
+      HashPartitioning(partitionExpressions, initialNumPartitions)
+    }
   }
 
   override protected def withNewChildInternal(newChild: LogicalPlan): RebalancePartitions =
@@ -1522,5 +1663,121 @@ case class LateralJoin(
 
   override protected def withNewChildInternal(newChild: LogicalPlan): LateralJoin = {
     copy(left = newChild)
+  }
+}
+
+/**
+ * A logical plan for as-of join.
+ */
+case class AsOfJoin(
+    left: LogicalPlan,
+    right: LogicalPlan,
+    asOfCondition: Expression,
+    condition: Option[Expression],
+    joinType: JoinType,
+    orderExpression: Expression,
+    toleranceAssertion: Option[Expression]) extends BinaryNode {
+
+  require(Seq(Inner, LeftOuter).contains(joinType),
+    s"Unsupported as-of join type $joinType")
+
+  override protected def stringArgs: Iterator[Any] = super.stringArgs.take(5)
+
+  override def output: Seq[Attribute] = {
+    joinType match {
+      case LeftOuter =>
+        left.output ++ right.output.map(_.withNullability(true))
+      case _ =>
+        left.output ++ right.output
+    }
+  }
+
+  def duplicateResolved: Boolean = left.outputSet.intersect(right.outputSet).isEmpty
+
+  override lazy val resolved: Boolean = {
+    childrenResolved &&
+      expressions.forall(_.resolved) &&
+      duplicateResolved &&
+      asOfCondition.dataType == BooleanType &&
+      condition.forall(_.dataType == BooleanType) &&
+      toleranceAssertion.forall { assertion =>
+        assertion.foldable && assertion.eval().asInstanceOf[Boolean]
+      }
+  }
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(AS_OF_JOIN)
+
+  override protected def withNewChildrenInternal(
+      newLeft: LogicalPlan, newRight: LogicalPlan): AsOfJoin = {
+    copy(left = newLeft, right = newRight)
+  }
+}
+
+object AsOfJoin {
+
+  def apply(
+      left: LogicalPlan,
+      right: LogicalPlan,
+      leftAsOf: Expression,
+      rightAsOf: Expression,
+      condition: Option[Expression],
+      joinType: JoinType,
+      tolerance: Option[Expression],
+      allowExactMatches: Boolean,
+      direction: AsOfJoinDirection): AsOfJoin = {
+    val asOfCond = makeAsOfCond(leftAsOf, rightAsOf, tolerance, allowExactMatches, direction)
+    val orderingExpr = makeOrderingExpr(leftAsOf, rightAsOf, direction)
+    AsOfJoin(left, right, asOfCond, condition, joinType,
+      orderingExpr, tolerance.map(t => GreaterThanOrEqual(t, Literal.default(t.dataType))))
+  }
+
+  private def makeAsOfCond(
+      leftAsOf: Expression,
+      rightAsOf: Expression,
+      tolerance: Option[Expression],
+      allowExactMatches: Boolean,
+      direction: AsOfJoinDirection): Expression = {
+    val base = (allowExactMatches, direction) match {
+      case (true, Backward) => GreaterThanOrEqual(leftAsOf, rightAsOf)
+      case (false, Backward) => GreaterThan(leftAsOf, rightAsOf)
+      case (true, Forward) => LessThanOrEqual(leftAsOf, rightAsOf)
+      case (false, Forward) => LessThan(leftAsOf, rightAsOf)
+      case (true, Nearest) => Literal.TrueLiteral
+      case (false, Nearest) => Not(EqualTo(leftAsOf, rightAsOf))
+    }
+    tolerance match {
+      case Some(tolerance) =>
+        (allowExactMatches, direction) match {
+          case (true, Backward) =>
+            And(base, GreaterThanOrEqual(rightAsOf, Subtract(leftAsOf, tolerance)))
+          case (false, Backward) =>
+            And(base, GreaterThan(rightAsOf, Subtract(leftAsOf, tolerance)))
+          case (true, Forward) =>
+            And(base, LessThanOrEqual(rightAsOf, Add(leftAsOf, tolerance)))
+          case (false, Forward) =>
+            And(base, LessThan(rightAsOf, Add(leftAsOf, tolerance)))
+          case (true, Nearest) =>
+            And(GreaterThanOrEqual(rightAsOf, Subtract(leftAsOf, tolerance)),
+              LessThanOrEqual(rightAsOf, Add(leftAsOf, tolerance)))
+          case (false, Nearest) =>
+            And(base,
+              And(GreaterThan(rightAsOf, Subtract(leftAsOf, tolerance)),
+                LessThan(rightAsOf, Add(leftAsOf, tolerance))))
+        }
+      case None => base
+    }
+  }
+
+  private def makeOrderingExpr(
+      leftAsOf: Expression,
+      rightAsOf: Expression,
+      direction: AsOfJoinDirection): Expression = {
+    direction match {
+      case Backward => Subtract(leftAsOf, rightAsOf)
+      case Forward => Subtract(rightAsOf, leftAsOf)
+      case Nearest =>
+        If(GreaterThan(leftAsOf, rightAsOf),
+          Subtract(leftAsOf, rightAsOf), Subtract(rightAsOf, leftAsOf))
+    }
   }
 }

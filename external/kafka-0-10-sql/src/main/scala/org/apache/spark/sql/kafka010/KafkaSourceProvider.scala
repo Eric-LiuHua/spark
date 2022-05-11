@@ -322,6 +322,15 @@ private[kafka010] class KafkaSourceProvider extends DataSourceRegister
         s"Option 'kafka.${ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG}' must be specified for " +
           s"configuring Kafka consumer")
     }
+
+    if (params.contains(MIN_OFFSET_PER_TRIGGER) && params.contains(MAX_OFFSET_PER_TRIGGER)) {
+      val minOffsets = params.get(MIN_OFFSET_PER_TRIGGER).get.toLong
+      val maxOffsets = params.get(MAX_OFFSET_PER_TRIGGER).get.toLong
+      if (minOffsets > maxOffsets) {
+        throw new IllegalArgumentException(s"The value of minOffsetPerTrigger($minOffsets) is " +
+          s"higher than the maxOffsetsPerTrigger($maxOffsets).")
+      }
+    }
   }
 
   private def validateStreamOptions(params: CaseInsensitiveMap[String]) = {
@@ -382,6 +391,10 @@ private[kafka010] class KafkaSourceProvider extends DataSourceRegister
     if (params.contains(MIN_OFFSET_PER_TRIGGER)) {
       logWarning("minOffsetsPerTrigger option ignored in batch queries")
     }
+
+    if (params.contains(MAX_TRIGGER_DELAY)) {
+      logWarning("maxTriggerDelay option ignored in batch queries")
+    }
   }
 
   class KafkaTable(includeHeaders: Boolean) extends Table with SupportsRead with SupportsWrite {
@@ -395,8 +408,8 @@ private[kafka010] class KafkaSourceProvider extends DataSourceRegister
       // ACCEPT_ANY_SCHEMA is needed because of the following reasons:
       // * Kafka writer validates the schema instead of the SQL analyzer (the schema is fixed)
       // * Read schema differs from write schema (please see Kafka integration guide)
-      Set(BATCH_READ, BATCH_WRITE, MICRO_BATCH_READ, CONTINUOUS_READ, STREAMING_WRITE,
-        ACCEPT_ANY_SCHEMA).asJava
+      ju.EnumSet.of(BATCH_READ, BATCH_WRITE, MICRO_BATCH_READ, CONTINUOUS_READ, STREAMING_WRITE,
+        ACCEPT_ANY_SCHEMA)
     }
 
     override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder =
@@ -549,6 +562,8 @@ private[kafka010] object KafkaSourceProvider extends Logging {
     "startingoffsetsbytimestampstrategy"
   private val GROUP_ID_PREFIX = "groupidprefix"
   private[kafka010] val INCLUDE_HEADERS = "includeheaders"
+  // This is only for internal testing and should not be used otherwise.
+  private[kafka010] val MOCK_SYSTEM_TIME = "_mockSystemTime"
 
   private[kafka010] object StrategyOnNoMatchStartingOffset extends Enumeration {
     val ERROR, LATEST = Value
@@ -713,7 +728,7 @@ private[kafka010] object KafkaSourceProvider extends Logging {
     parameters
       .keySet
       .filter(_.toLowerCase(Locale.ROOT).startsWith("kafka."))
-      .map { k => k.drop(6).toString -> parameters(k) }
+      .map { k => k.drop(6) -> parameters(k) }
       .toMap
   }
 }

@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql
 
-import java.time.{Duration, LocalDateTime, Period}
+import java.time.{Duration, Period}
 
 import scala.util.Random
 
@@ -876,6 +876,11 @@ class DataFrameAggregateSuite extends QueryTest
     checkAnswer(yearOfMaxEarnings, Row("dotNET", 2013) :: Row("Java", 2013) :: Nil)
 
     checkAnswer(
+      courseSales.groupBy("course").agg(max_by(col("year"), col("earnings"))),
+      Row("dotNET", 2013) :: Row("Java", 2013) :: Nil
+    )
+
+    checkAnswer(
       sql("SELECT max_by(x, y) FROM VALUES (('a', 10)), (('b', 50)), (('c', 20)) AS tab(x, y)"),
       Row("b") :: Nil
     )
@@ -930,6 +935,11 @@ class DataFrameAggregateSuite extends QueryTest
     val yearOfMinEarnings =
       sql("SELECT course, min_by(year, earnings) FROM courseSales GROUP BY course")
     checkAnswer(yearOfMinEarnings, Row("dotNET", 2012) :: Row("Java", 2012) :: Nil)
+
+    checkAnswer(
+      courseSales.groupBy("course").agg(min_by(col("year"), col("earnings"))),
+      Row("dotNET", 2012) :: Row("Java", 2012) :: Nil
+    )
 
     checkAnswer(
       sql("SELECT min_by(x, y) FROM VALUES (('a', 10)), (('b', 50)), (('c', 20)) AS tab(x, y)"),
@@ -1015,10 +1025,15 @@ class DataFrameAggregateSuite extends QueryTest
         sql("SELECT x FROM tempView GROUP BY x HAVING COUNT_IF(NULL) > 0"),
         Nil)
 
-      val error = intercept[AnalysisException] {
-        sql("SELECT COUNT_IF(x) FROM tempView")
+      // When ANSI mode is on, it will implicit cast the string as boolean and throw a runtime
+      // error. Here we simply test with ANSI mode off.
+      if (!conf.ansiEnabled) {
+        val error = intercept[AnalysisException] {
+          sql("SELECT COUNT_IF(x) FROM tempView")
+        }
+        assert(error.message.contains("cannot resolve 'count_if(tempview.x)' due to data type " +
+          "mismatch: argument 1 requires boolean type, however, 'tempview.x' is of string type"))
       }
-      assert(error.message.contains("function count_if requires boolean type"))
     }
   }
 
@@ -1125,9 +1140,11 @@ class DataFrameAggregateSuite extends QueryTest
     val mapDF = Seq(Tuple1(Map("a" -> "a"))).toDF("col")
     checkAnswer(mapDF.groupBy(struct($"col.a")).count().select("count"), Row(1))
 
-    val nonStringMapDF = Seq(Tuple1(Map(1 -> 1))).toDF("col")
-    // Spark implicit casts string literal "a" to int to match the key type.
-    checkAnswer(nonStringMapDF.groupBy(struct($"col.a")).count().select("count"), Row(1))
+    if (!conf.ansiEnabled) {
+      val nonStringMapDF = Seq(Tuple1(Map(1 -> 1))).toDF("col")
+      // Spark implicit casts string literal "a" to int to match the key type.
+      checkAnswer(nonStringMapDF.groupBy(struct($"col.a")).count().select("count"), Row(1))
+    }
 
     val arrayDF = Seq(Tuple1(Seq(1))).toDF("col")
     val e = intercept[AnalysisException](arrayDF.groupBy(struct($"col.a")).count())
@@ -1261,12 +1278,12 @@ class DataFrameAggregateSuite extends QueryTest
     val error = intercept[SparkException] {
       checkAnswer(df2.select(sum($"year-month")), Nil)
     }
-    assert(error.toString contains "java.lang.ArithmeticException: integer overflow")
+    assert(error.toString contains "SparkArithmeticException: integer overflow")
 
     val error2 = intercept[SparkException] {
       checkAnswer(df2.select(sum($"day")), Nil)
     }
-    assert(error2.toString contains "java.lang.ArithmeticException: long overflow")
+    assert(error2.toString contains "SparkArithmeticException: long overflow")
   }
 
   test("SPARK-34837: Support ANSI SQL intervals by the aggregate function `avg`") {
@@ -1395,12 +1412,12 @@ class DataFrameAggregateSuite extends QueryTest
     val error = intercept[SparkException] {
       checkAnswer(df2.select(avg($"year-month")), Nil)
     }
-    assert(error.toString contains "java.lang.ArithmeticException: integer overflow")
+    assert(error.toString contains "SparkArithmeticException: integer overflow")
 
     val error2 = intercept[SparkException] {
       checkAnswer(df2.select(avg($"day")), Nil)
     }
-    assert(error2.toString contains "java.lang.ArithmeticException: long overflow")
+    assert(error2.toString contains "SparkArithmeticException: long overflow")
 
     val df3 = intervalData.filter($"class" > 4)
     val avgDF3 = df3.select(avg($"year-month"), avg($"day"))
@@ -1417,15 +1434,20 @@ class DataFrameAggregateSuite extends QueryTest
     checkAnswer(df2, Row(Period.ofYears(1), 1))
   }
 
-  test("SPARK-36054: Support group by TimestampNTZ column") {
-    val ts1 = "2021-01-01T00:00:00"
-    val ts2 = "2021-01-01T00:00:01"
-    val localDateTime = Seq(ts1, ts1, ts2).map(LocalDateTime.parse)
-    val df = localDateTime.toDF("ts").groupBy("ts").count().orderBy("ts")
-    val expectedSchema =
-      new StructType().add(StructField("ts", TimestampNTZType)).add("count", LongType, false)
-    assert (df.schema == expectedSchema)
-    checkAnswer(df, Seq(Row(LocalDateTime.parse(ts1), 2), Row(LocalDateTime.parse(ts2), 1)))
+  test("SPARK-36926: decimal average mistakenly overflow") {
+    val df = (1 to 10).map(_ => "9999999999.99").toDF("d")
+    val res = df.select($"d".cast("decimal(12, 2)").as("d")).agg(avg($"d").cast("string"))
+    checkAnswer(res, Row("9999999999.990000"))
+  }
+
+  test("SPARK-38185: Fix data incorrect if aggregate function is empty") {
+    val emptyAgg = Map.empty[String, String]
+    assert(spark.range(2).where("id > 2").agg(emptyAgg).limit(1).count == 1)
+  }
+
+  test("SPARK-38221: group by stream of complex expressions should not fail") {
+    val df = Seq(1).toDF("id").groupBy(Stream($"id" + 1, $"id" + 2): _*).sum("id")
+    checkAnswer(df, Row(2, 3, 1))
   }
 }
 

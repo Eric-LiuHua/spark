@@ -111,7 +111,11 @@ object FileFormatWriter extends Logging {
     FileOutputFormat.setOutputPath(job, new Path(outputSpec.outputPath))
 
     val partitionSet = AttributeSet(partitionColumns)
-    val dataColumns = outputSpec.outputColumns.filterNot(partitionSet.contains)
+    // cleanup the internal metadata information of
+    // the file source metadata attribute if any before write out
+    val finalOutputSpec = outputSpec.copy(outputColumns = outputSpec.outputColumns
+      .map(FileSourceMetadataAttribute.cleanupFileSourceMetadataInformation))
+    val dataColumns = finalOutputSpec.outputColumns.filterNot(partitionSet.contains)
 
     var needConvert = false
     val projectList: Seq[NamedExpression] = plan.output.map {
@@ -122,12 +126,34 @@ object FileFormatWriter extends Logging {
     }
     val empty2NullPlan = if (needConvert) ProjectExec(projectList, plan) else plan
 
-    val bucketIdExpression = bucketSpec.map { spec =>
+    val writerBucketSpec = bucketSpec.map { spec =>
       val bucketColumns = spec.bucketColumnNames.map(c => dataColumns.find(_.name == c).get)
-      // Use `HashPartitioning.partitionIdExpression` as our bucket id expression, so that we can
-      // guarantee the data distribution is same between shuffle and bucketed data source, which
-      // enables us to only shuffle one side when join a bucketed table and a normal one.
-      HashPartitioning(bucketColumns, spec.numBuckets).partitionIdExpression
+
+      if (options.getOrElse(BucketingUtils.optionForHiveCompatibleBucketWrite, "false") ==
+        "true") {
+        // Hive bucketed table: use `HiveHash` and bitwise-and as bucket id expression.
+        // Without the extra bitwise-and operation, we can get wrong bucket id when hash value of
+        // columns is negative. See Hive implementation in
+        // `org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorUtils#getBucketNumber()`.
+        val hashId = BitwiseAnd(HiveHash(bucketColumns), Literal(Int.MaxValue))
+        val bucketIdExpression = Pmod(hashId, Literal(spec.numBuckets))
+
+        // The bucket file name prefix is following Hive, Presto and Trino conversion, so this
+        // makes sure Hive bucketed table written by Spark, can be read by other SQL engines.
+        //
+        // Hive: `org.apache.hadoop.hive.ql.exec.Utilities#getBucketIdFromFile()`.
+        // Trino: `io.trino.plugin.hive.BackgroundHiveSplitLoader#BUCKET_PATTERNS`.
+        val fileNamePrefix = (bucketId: Int) => f"$bucketId%05d_0_"
+        WriterBucketSpec(bucketIdExpression, fileNamePrefix)
+      } else {
+        // Spark bucketed table: use `HashPartitioning.partitionIdExpression` as bucket id
+        // expression, so that we can guarantee the data distribution is same between shuffle and
+        // bucketed data source, which enables us to only shuffle one side when join a bucketed
+        // table and a normal one.
+        val bucketIdExpression = HashPartitioning(bucketColumns, spec.numBuckets)
+          .partitionIdExpression
+        WriterBucketSpec(bucketIdExpression, (_: Int) => "")
+      }
     }
     val sortColumns = bucketSpec.toSeq.flatMap {
       spec => spec.sortColumnNames.map(c => dataColumns.find(_.name == c).get)
@@ -145,12 +171,12 @@ object FileFormatWriter extends Logging {
       uuid = UUID.randomUUID.toString,
       serializableHadoopConf = new SerializableConfiguration(job.getConfiguration),
       outputWriterFactory = outputWriterFactory,
-      allColumns = outputSpec.outputColumns,
+      allColumns = finalOutputSpec.outputColumns,
       dataColumns = dataColumns,
       partitionColumns = partitionColumns,
-      bucketIdExpression = bucketIdExpression,
-      path = outputSpec.outputPath,
-      customPartitionLocations = outputSpec.customPartitionLocations,
+      bucketSpec = writerBucketSpec,
+      path = finalOutputSpec.outputPath,
+      customPartitionLocations = finalOutputSpec.customPartitionLocations,
       maxRecordsPerFile = caseInsensitiveOptions.get("maxRecordsPerFile").map(_.toLong)
         .getOrElse(sparkSession.sessionState.conf.maxRecordsPerFile),
       timeZoneId = caseInsensitiveOptions.get(DateTimeUtils.TIMEZONE_OPTION)
@@ -159,7 +185,8 @@ object FileFormatWriter extends Logging {
     )
 
     // We should first sort by partition columns, then bucket id, and finally sorting columns.
-    val requiredOrdering = partitionColumns ++ bucketIdExpression ++ sortColumns
+    val requiredOrdering =
+      partitionColumns ++ writerBucketSpec.map(_.bucketIdExpression) ++ sortColumns
     // the sort order doesn't matter
     val actualOrdering = empty2NullPlan.outputOrdering.map(_.child)
     val orderingMatched = if (requiredOrdering.length > actualOrdering.length) {
@@ -189,7 +216,7 @@ object FileFormatWriter extends Logging {
         // the physical plan may have different attribute ids due to optimizer removing some
         // aliases. Here we bind the expression ahead to avoid potential attribute ids mismatch.
         val orderingExpr = bindReferences(
-          requiredOrdering.map(SortOrder(_, Ascending)), outputSpec.outputColumns)
+          requiredOrdering.map(SortOrder(_, Ascending)), finalOutputSpec.outputColumns)
         val sortPlan = SortExec(
           orderingExpr,
           global = false,
@@ -286,7 +313,7 @@ object FileFormatWriter extends Logging {
       if (sparkPartitionId != 0 && !iterator.hasNext) {
         // In case of empty job, leave first partition to save meta for file format like parquet.
         new EmptyDirectoryDataWriter(description, taskAttemptContext, committer)
-      } else if (description.partitionColumns.isEmpty && description.bucketIdExpression.isEmpty) {
+      } else if (description.partitionColumns.isEmpty && description.bucketSpec.isEmpty) {
         new SingleDirectoryDataWriter(description, taskAttemptContext, committer)
       } else {
         concurrentOutputWriterSpec match {
@@ -301,7 +328,6 @@ object FileFormatWriter extends Logging {
     try {
       Utils.tryWithSafeFinallyAndFailureCallbacks(block = {
         // Execute the task to write rows out and commit the task.
-        val taskAttemptID = taskAttemptContext.getTaskAttemptID
         dataWriter.writeWithIterator(iterator)
         dataWriter.commit()
       })(catchBlock = {

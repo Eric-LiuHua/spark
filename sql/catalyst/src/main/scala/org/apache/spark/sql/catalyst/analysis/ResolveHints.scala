@@ -120,7 +120,7 @@ object ResolveHints {
           case r: SubqueryAlias if matchedIdentifierInHint(extractIdentifier(r)) =>
             ResolvedHint(plan, createHintInfo(hintName))
 
-          case _: ResolvedHint | _: View | _: With | _: SubqueryAlias =>
+          case _: ResolvedHint | _: View | _: UnresolvedWith | _: SubqueryAlias =>
             // Don't traverse down these nodes.
             // For an existing strategy hint, there is no chance for a match from this point down.
             // The rest (view, with, subquery) indicates different scopes that we shouldn't traverse
@@ -250,14 +250,26 @@ object ResolveHints {
     }
 
     private def createRebalance(hint: UnresolvedHint): LogicalPlan = {
+      def createRebalancePartitions(
+          partitionExprs: Seq[Any], initialNumPartitions: Option[Int]): RebalancePartitions = {
+        val invalidParams = partitionExprs.filter(!_.isInstanceOf[UnresolvedAttribute])
+        if (invalidParams.nonEmpty) {
+          val hintName = hint.name.toUpperCase(Locale.ROOT)
+          throw QueryCompilationErrors.invalidHintParameterError(hintName, invalidParams)
+        }
+        RebalancePartitions(
+          partitionExprs.map(_.asInstanceOf[Expression]),
+          hint.child,
+          initialNumPartitions)
+      }
+
       hint.parameters match {
+        case param @ Seq(IntegerLiteral(numPartitions), _*) =>
+          createRebalancePartitions(param.tail, Some(numPartitions))
+        case param @ Seq(numPartitions: Int, _*) =>
+          createRebalancePartitions(param.tail, Some(numPartitions))
         case partitionExprs @ Seq(_*) =>
-          val invalidParams = partitionExprs.filter(!_.isInstanceOf[UnresolvedAttribute])
-          if (invalidParams.nonEmpty) {
-            val hintName = hint.name.toUpperCase(Locale.ROOT)
-            throw QueryCompilationErrors.invalidHintParameterError(hintName, invalidParams)
-          }
-          RebalancePartitions(partitionExprs.map(_.asInstanceOf[Expression]), hint.child)
+          createRebalancePartitions(partitionExprs, None)
       }
     }
 

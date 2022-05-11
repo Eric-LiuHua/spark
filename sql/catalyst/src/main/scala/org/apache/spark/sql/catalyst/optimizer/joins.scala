@@ -18,6 +18,7 @@
 package org.apache.spark.sql.catalyst.optimizer
 
 import scala.annotation.tailrec
+import scala.util.control.NonFatal
 
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.planning.ExtractFiltersAndInnerJoins
@@ -143,9 +144,18 @@ object EliminateOuterJoin extends Rule[LogicalPlan] with PredicateHelper {
     val attributes = e.references.toSeq
     val emptyRow = new GenericInternalRow(attributes.length)
     val boundE = BindReferences.bindReference(e, attributes)
-    if (boundE.find(_.isInstanceOf[Unevaluable]).isDefined) return false
-    val v = boundE.eval(emptyRow)
-    v == null || v == false
+    if (boundE.exists(_.isInstanceOf[Unevaluable])) return false
+
+    // some expressions, like map(), may throw an exception when dealing with null values.
+    // therefore, we need to handle exceptions.
+    try {
+      val v = boundE.eval(emptyRow)
+      v == null || v == false
+    } catch {
+      case NonFatal(e) =>
+        // cannot filter out null if `where` expression throws an exception with null input
+        false
+    }
   }
 
   private def buildNewJoinType(filter: Filter, join: Join): JoinType = {
@@ -173,16 +183,16 @@ object EliminateOuterJoin extends Rule[LogicalPlan] with PredicateHelper {
       if (j.joinType == newJoinType) f else Filter(condition, j.copy(joinType = newJoinType))
 
     case a @ Aggregate(_, _, Join(left, _, LeftOuter, _, _))
-        if a.groupOnly && a.references.subsetOf(AttributeSet(left.output)) =>
+        if a.groupOnly && a.references.subsetOf(left.outputSet) =>
       a.copy(child = left)
     case a @ Aggregate(_, _, Join(_, right, RightOuter, _, _))
-        if a.groupOnly && a.references.subsetOf(AttributeSet(right.output)) =>
+        if a.groupOnly && a.references.subsetOf(right.outputSet) =>
       a.copy(child = right)
     case a @ Aggregate(_, _, p @ Project(_, Join(left, _, LeftOuter, _, _)))
-        if a.groupOnly && a.references.subsetOf(AttributeSet(left.output)) =>
+        if a.groupOnly && p.references.subsetOf(left.outputSet) =>
       a.copy(child = p.copy(child = left))
     case a @ Aggregate(_, _, p @ Project(_, Join(_, right, RightOuter, _, _)))
-        if a.groupOnly && a.references.subsetOf(AttributeSet(right.output)) =>
+        if a.groupOnly && p.references.subsetOf(right.outputSet) =>
       a.copy(child = p.copy(child = right))
   }
 }
@@ -195,9 +205,9 @@ object EliminateOuterJoin extends Rule[LogicalPlan] with PredicateHelper {
 object ExtractPythonUDFFromJoinCondition extends Rule[LogicalPlan] with PredicateHelper {
 
   private def hasUnevaluablePythonUDF(expr: Expression, j: Join): Boolean = {
-    expr.find { e =>
+    expr.exists { e =>
       PythonUDF.isScalarPythonUDF(e) && !canEvaluate(e, j.left) && !canEvaluate(e, j.right)
-    }.isDefined
+    }
   }
 
   override def apply(plan: LogicalPlan): LogicalPlan = plan.transformUpWithPruning(
@@ -275,7 +285,7 @@ trait JoinSelectionHelper {
     } else {
       hintToPreferShuffleHashJoinLeft(hint) ||
         (!conf.preferSortMergeJoin && canBuildLocalHashMapBySize(left, conf) &&
-          muchSmaller(left, right)) ||
+          muchSmaller(left, right, conf)) ||
         forceApplyShuffledHashJoin(conf)
     }
     val buildRight = if (hintOnly) {
@@ -283,7 +293,7 @@ trait JoinSelectionHelper {
     } else {
       hintToPreferShuffleHashJoinRight(hint) ||
         (!conf.preferSortMergeJoin && canBuildLocalHashMapBySize(right, conf) &&
-          muchSmaller(right, left)) ||
+          muchSmaller(right, left, conf)) ||
         forceApplyShuffledHashJoin(conf)
     }
     getBuildSide(
@@ -347,6 +357,16 @@ trait JoinSelectionHelper {
         join.hint, hintOnly = false, conf).isDefined
   }
 
+  def canPruneLeft(joinType: JoinType): Boolean = joinType match {
+    case Inner | LeftSemi | RightOuter => true
+    case _ => false
+  }
+
+  def canPruneRight(joinType: JoinType): Boolean = joinType match {
+    case Inner | LeftSemi | LeftOuter => true
+    case _ => false
+  }
+
   def hintToBroadcastLeft(hint: JoinHint): Boolean = {
     hint.leftHint.exists(_.strategy.contains(BROADCAST))
   }
@@ -377,6 +397,10 @@ trait JoinSelectionHelper {
 
   def hintToPreferShuffleHashJoinRight(hint: JoinHint): Boolean = {
     hint.rightHint.exists(_.strategy.contains(PREFER_SHUFFLE_HASH))
+  }
+
+  def hintToPreferShuffleHashJoin(hint: JoinHint): Boolean = {
+    hintToPreferShuffleHashJoinLeft(hint) || hintToPreferShuffleHashJoinRight(hint)
   }
 
   def hintToShuffleHashJoin(hint: JoinHint): Boolean = {
@@ -422,14 +446,15 @@ trait JoinSelectionHelper {
   }
 
   /**
-   * Returns whether plan a is much smaller (3X) than plan b.
+   * Returns true if the data size of plan a multiplied by SHUFFLE_HASH_JOIN_FACTOR
+   * is smaller than plan b.
    *
    * The cost to build hash map is higher than sorting, we should only build hash map on a table
    * that is much smaller than other one. Since we does not have the statistic for number of rows,
    * use the size of bytes here as estimation.
    */
-  private def muchSmaller(a: LogicalPlan, b: LogicalPlan): Boolean = {
-    a.stats.sizeInBytes * 3 <= b.stats.sizeInBytes
+  private def muchSmaller(a: LogicalPlan, b: LogicalPlan, conf: SQLConf): Boolean = {
+    a.stats.sizeInBytes * conf.getConf(SQLConf.SHUFFLE_HASH_JOIN_FACTOR) <= b.stats.sizeInBytes
   }
 
   /**

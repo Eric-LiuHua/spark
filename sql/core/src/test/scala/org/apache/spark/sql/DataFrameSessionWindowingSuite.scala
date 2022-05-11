@@ -17,12 +17,16 @@
 
 package org.apache.spark.sql
 
+import java.time.LocalDateTime
+
 import org.scalatest.BeforeAndAfterEach
 
-import org.apache.spark.sql.catalyst.plans.logical.Expand
+import org.apache.spark.sql.catalyst.encoders.RowEncoder
+import org.apache.spark.sql.catalyst.expressions.AttributeReference
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Expand}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.sql.types.StringType
+import org.apache.spark.sql.types._
 
 class DataFrameSessionWindowingSuite extends QueryTest with SharedSparkSession
   with BeforeAndAfterEach {
@@ -79,7 +83,7 @@ class DataFrameSessionWindowingSuite extends QueryTest with SharedSparkSession
     // key "b" => (19:39:27 ~ 19:39:37)
 
     checkAnswer(
-      df.groupBy(session_window($"time", "10 seconds"), 'id)
+      df.groupBy(session_window($"time", "10 seconds"), Symbol("id"))
         .agg(count("*").as("counts"), sum("value").as("sum"))
         .orderBy($"session_window.start".asc)
         .selectExpr("CAST(session_window.start AS STRING)", "CAST(session_window.end AS STRING)",
@@ -109,7 +113,7 @@ class DataFrameSessionWindowingSuite extends QueryTest with SharedSparkSession
     // key "b" => (19:39:27 ~ 19:39:37)
 
     checkAnswer(
-      df.groupBy(session_window($"time", "10 seconds"), 'id)
+      df.groupBy(session_window($"time", "10 seconds"), Symbol("id"))
         .agg(count("*").as("counts"), sum_distinct(col("value")).as("sum"))
         .orderBy($"session_window.start".asc)
         .selectExpr("CAST(session_window.start AS STRING)", "CAST(session_window.end AS STRING)",
@@ -138,7 +142,7 @@ class DataFrameSessionWindowingSuite extends QueryTest with SharedSparkSession
     // key "b" => (19:39:27 ~ 19:39:37)
 
     checkAnswer(
-      df.groupBy(session_window($"time", "10 seconds"), 'id)
+      df.groupBy(session_window($"time", "10 seconds"), Symbol("id"))
         .agg(sum_distinct(col("value")).as("sum"), sum_distinct(col("value2")).as("sum2"))
         .orderBy($"session_window.start".asc)
         .selectExpr("CAST(session_window.start AS STRING)", "CAST(session_window.end AS STRING)",
@@ -167,7 +171,7 @@ class DataFrameSessionWindowingSuite extends QueryTest with SharedSparkSession
     // b => (19:39:27 ~ 19:39:37), (19:39:39 ~ 19:39:55)
 
     checkAnswer(
-      df.groupBy(session_window($"time", "10 seconds"), 'id)
+      df.groupBy(session_window($"time", "10 seconds"), Symbol("id"))
         .agg(count("*").as("counts"), sum("value").as("sum"))
         .orderBy($"session_window.start".asc)
         .selectExpr("CAST(session_window.start AS STRING)", "CAST(session_window.end AS STRING)",
@@ -263,9 +267,10 @@ class DataFrameSessionWindowingSuite extends QueryTest with SharedSparkSession
   private def withTempTable(f: String => Unit): Unit = {
     val tableName = "temp"
     Seq(
-      ("2016-03-27 19:39:34", 1),
-      ("2016-03-27 19:39:56", 2),
-      ("2016-03-27 19:39:27", 4)).toDF("time", "value").createOrReplaceTempView(tableName)
+      ("2016-03-27 19:39:34", 1, "10 seconds"),
+      ("2016-03-27 19:39:56", 2, "20 seconds"),
+      ("2016-03-27 19:39:27", 4, "30 seconds")).toDF("time", "value", "duration")
+      .createOrReplaceTempView(tableName)
     try {
       f(tableName)
     } finally {
@@ -285,6 +290,209 @@ class DataFrameSessionWindowingSuite extends QueryTest with SharedSparkSession
           Row("2016-03-27 19:39:56", "2016-03-27 19:40:06", 2)
         )
       )
+    }
+  }
+
+  test("SPARK-36465: time window in SQL with dynamic string expression") {
+    withTempTable { table =>
+      checkAnswer(
+        spark.sql(s"""select session_window(time, duration), value from $table""")
+          .select($"session_window.start".cast(StringType), $"session_window.end".cast(StringType),
+            $"value"),
+        Seq(
+          Row("2016-03-27 19:39:27", "2016-03-27 19:39:57", 4),
+          Row("2016-03-27 19:39:34", "2016-03-27 19:39:44", 1),
+          Row("2016-03-27 19:39:56", "2016-03-27 19:40:16", 2)
+        )
+      )
+    }
+  }
+
+  test("SPARK-36465: Unsupported dynamic gap datatype") {
+    withTempTable { table =>
+      val err = intercept[AnalysisException] {
+        spark.sql(s"""select session_window(time, 1.0), value from $table""")
+          .select($"session_window.start".cast(StringType), $"session_window.end".cast(StringType),
+            $"value")
+      }
+      assert(err.message.contains("Gap duration expression used in session window must be " +
+        "CalendarIntervalType, but got DecimalType(2,1)"))
+    }
+  }
+
+  test("SPARK-36465: time window in SQL with UDF as gap duration") {
+    withTempTable { table =>
+
+      spark.udf.register("gapDuration",
+        (i: java.lang.Integer) => s"${i * 10} seconds")
+
+      checkAnswer(
+        spark.sql(s"""select session_window(time, gapDuration(value)), value from $table""")
+          .select($"session_window.start".cast(StringType), $"session_window.end".cast(StringType),
+            $"value"),
+        Seq(
+          Row("2016-03-27 19:39:27", "2016-03-27 19:40:07", 4),
+          Row("2016-03-27 19:39:34", "2016-03-27 19:39:44", 1),
+          Row("2016-03-27 19:39:56", "2016-03-27 19:40:16", 2)
+        )
+      )
+    }
+  }
+
+  test("SPARK-36465: time window in SQL with conditional expression as gap duration") {
+    withTempTable { table =>
+
+      checkAnswer(
+        spark.sql("select session_window(time, " +
+          """case when value = 1 then "2 seconds" when value = 2 then "10 seconds" """ +
+          s"""else "20 seconds" end), value from $table""")
+          .select($"session_window.start".cast(StringType), $"session_window.end".cast(StringType),
+            $"value"),
+        Seq(
+          Row("2016-03-27 19:39:27", "2016-03-27 19:39:47", 4),
+          Row("2016-03-27 19:39:34", "2016-03-27 19:39:36", 1),
+          Row("2016-03-27 19:39:56", "2016-03-27 19:40:06", 2)
+        )
+      )
+    }
+  }
+
+  test("SPARK-36465: filter out events with negative/zero gap duration") {
+    withTempTable { table =>
+
+      spark.udf.register("gapDuration",
+        (i: java.lang.Integer) => {
+          if (i == 1) {
+            "0 seconds"
+          } else if (i == 2) {
+            "-10 seconds"
+          } else {
+            "5 seconds"
+          }
+        })
+
+      checkAnswer(
+        spark.sql(s"""select session_window(time, gapDuration(value)), value from $table""")
+          .groupBy($"session_window")
+          .agg(count("*").as("counts"))
+          .select($"session_window.start".cast("string"), $"session_window.end".cast("string"),
+            $"counts"),
+        Seq(Row("2016-03-27 19:39:27", "2016-03-27 19:39:32", 1))
+      )
+    }
+  }
+
+  test("SPARK-36465: filter out events with invalid gap duration.") {
+    val df = Seq(
+      ("2016-03-27 19:39:30", 1, "a")).toDF("time", "value", "id")
+
+    checkAnswer(
+      df.groupBy(session_window($"time", "x sec"))
+        .agg(count("*").as("counts"))
+        .orderBy($"session_window.start".asc)
+        .select($"session_window.start".cast("string"), $"session_window.end".cast("string"),
+          $"counts"),
+      Seq()
+    )
+
+    withTempTable { table =>
+      checkAnswer(
+        spark.sql("select session_window(time, " +
+          """case when value = 1 then "2 seconds" when value = 2 then "invalid gap duration" """ +
+          s"""else "20 seconds" end), value from $table""")
+          .select($"session_window.start".cast(StringType), $"session_window.end".cast(StringType),
+            $"value"),
+        Seq(
+          Row("2016-03-27 19:39:27", "2016-03-27 19:39:47", 4),
+          Row("2016-03-27 19:39:34", "2016-03-27 19:39:36", 1)
+        )
+      )
+    }
+  }
+
+  test("SPARK-36724: Support timestamp_ntz as a type of time column for SessionWindow") {
+    val df = Seq((LocalDateTime.parse("2016-03-27T19:39:30"), 1, "a"),
+      (LocalDateTime.parse("2016-03-27T19:39:25"), 2, "a")).toDF("time", "value", "id")
+    val aggDF =
+      df.groupBy(session_window($"time", "10 seconds"))
+        .agg(count("*").as("counts"))
+        .orderBy($"session_window.start".asc)
+        .select($"session_window.start".cast("string"),
+          $"session_window.end".cast("string"), $"counts")
+
+    val aggregate = aggDF.queryExecution.analyzed.children(0).children(0)
+    assert(aggregate.isInstanceOf[Aggregate])
+
+    val timeWindow = aggregate.asInstanceOf[Aggregate].groupingExpressions(0)
+    assert(timeWindow.isInstanceOf[AttributeReference])
+
+    val attributeReference = timeWindow.asInstanceOf[AttributeReference]
+    assert(attributeReference.name == "session_window")
+
+    val expectedSchema = StructType(
+      Seq(StructField("start", TimestampNTZType), StructField("end", TimestampNTZType)))
+    assert(attributeReference.dataType == expectedSchema)
+
+    checkAnswer(aggDF, Seq(Row("2016-03-27 19:39:25", "2016-03-27 19:39:40", 2)))
+  }
+
+  test("SPARK-38227: 'start' and 'end' fields should be nullable") {
+    // We expect the fields in window struct as nullable since the dataType of SessionWindow
+    // defines them as nullable. The rule 'SessionWindowing' should respect the dataType.
+    val df1 = Seq(
+      ("hello", "2016-03-27 09:00:05", 1),
+      ("structured", "2016-03-27 09:00:32", 2)).toDF("id", "time", "value")
+    val df2 = Seq(
+      ("world", LocalDateTime.parse("2016-03-27T09:00:05"), 1),
+      ("spark", LocalDateTime.parse("2016-03-27T09:00:32"), 2)).toDF("id", "time", "value")
+
+    val udf = spark.udf.register("gapDuration", (s: String) => {
+      if (s == "hello") {
+        "1 second"
+      } else if (s == "structured") {
+        // zero gap duration will be filtered out from aggregation
+        "0 second"
+      } else if (s == "world") {
+        // negative gap duration will be filtered out from aggregation
+        "-10 seconds"
+      } else {
+        "10 seconds"
+      }
+    })
+
+    def validateWindowColumnInSchema(schema: StructType, colName: String): Unit = {
+      schema.find(_.name == colName) match {
+        case Some(StructField(_, st: StructType, _, _)) =>
+          assertFieldInWindowStruct(st, "start")
+          assertFieldInWindowStruct(st, "end")
+
+        case _ => fail("Failed to find suitable window column from DataFrame!")
+      }
+    }
+
+    def assertFieldInWindowStruct(windowType: StructType, fieldName: String): Unit = {
+      val field = windowType.fields.find(_.name == fieldName)
+      assert(field.isDefined, s"'$fieldName' field should exist in window struct")
+      assert(field.get.nullable, s"'$fieldName' field should be nullable")
+    }
+
+    for {
+      df <- Seq(df1, df2)
+      nullable <- Seq(true, false)
+    } {
+      val dfWithDesiredNullability = new DataFrame(df.queryExecution, RowEncoder(
+        StructType(df.schema.fields.map(_.copy(nullable = nullable)))))
+      // session window without dynamic gap
+      val windowedProject = dfWithDesiredNullability
+        .select(session_window($"time", "10 seconds").as("session"), $"value")
+      val schema = windowedProject.queryExecution.optimizedPlan.schema
+      validateWindowColumnInSchema(schema, "session")
+
+      // session window with dynamic gap
+      val windowedProject2 = dfWithDesiredNullability
+        .select(session_window($"time", udf($"id")).as("session"), $"value")
+      val schema2 = windowedProject2.queryExecution.optimizedPlan.schema
+      validateWindowColumnInSchema(schema2, "session")
     }
   }
 }

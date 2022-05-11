@@ -23,15 +23,15 @@ import java.util.Properties
 
 import org.scalatest.time.SpanSugar._
 
-import org.apache.spark.sql.Row
+import org.apache.spark.sql.{Row, SaveMode}
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils._
 import org.apache.spark.sql.types.{BooleanType, ByteType, ShortType, StructType}
 import org.apache.spark.tags.DockerTest
 
 /**
- * To run this test suite for a specific version (e.g., ibmcom/db2:11.5.4.0):
+ * To run this test suite for a specific version (e.g., ibmcom/db2:11.5.6.0a):
  * {{{
- *   ENABLE_DOCKER_INTEGRATION_TESTS=1 DB2_DOCKER_IMAGE_NAME=ibmcom/db2:11.5.4.0
+ *   ENABLE_DOCKER_INTEGRATION_TESTS=1 DB2_DOCKER_IMAGE_NAME=ibmcom/db2:11.5.6.0a
  *     ./build/sbt -Pdocker-integration-tests
  *     "testOnly org.apache.spark.sql.jdbc.DB2IntegrationSuite"
  * }}}
@@ -39,7 +39,7 @@ import org.apache.spark.tags.DockerTest
 @DockerTest
 class DB2IntegrationSuite extends DockerJDBCIntegrationSuite {
   override val db = new DatabaseOnDocker {
-    override val imageName = sys.env.getOrElse("DB2_DOCKER_IMAGE_NAME", "ibmcom/db2:11.5.4.0")
+    override val imageName = sys.env.getOrElse("DB2_DOCKER_IMAGE_NAME", "ibmcom/db2:11.5.6.0a")
     override val env = Map(
       "DB2INST1_PASSWORD" -> "rootpass",
       "LICENSE" -> "accept",
@@ -197,5 +197,24 @@ class DB2IntegrationSuite extends DockerJDBCIntegrationSuite {
          |OPTIONS (url '$jdbcUrl', query '$query')
        """.stripMargin.replaceAll("\n", " "))
     assert(sql("select x, y from queryOption").collect.toSet == expectedResult)
+  }
+
+  test("SPARK-30062") {
+    val expectedResult = Set(
+      (42, "fred"),
+      (17, "dave")
+    ).map { case (x, y) =>
+      Row(Integer.valueOf(x), String.valueOf(y))
+    }
+    val df = sqlContext.read.jdbc(jdbcUrl, "tbl", new Properties)
+    for (_ <- 0 to 2) {
+      df.write.mode(SaveMode.Append).jdbc(jdbcUrl, "tblcopy", new Properties)
+    }
+    assert(sqlContext.read.jdbc(jdbcUrl, "tblcopy", new Properties).count === 6)
+    df.write.mode(SaveMode.Overwrite).option("truncate", true)
+      .jdbc(jdbcUrl, "tblcopy", new Properties)
+    val actual = sqlContext.read.jdbc(jdbcUrl, "tblcopy", new Properties).collect
+    assert(actual.length === 2)
+    assert(actual.toSet === expectedResult)
   }
 }

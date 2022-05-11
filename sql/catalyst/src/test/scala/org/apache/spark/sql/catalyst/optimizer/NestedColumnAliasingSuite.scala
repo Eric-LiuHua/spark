@@ -20,13 +20,14 @@ package org.apache.spark.sql.catalyst.optimizer
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.sql.catalyst.SchemaPruningTest
+import org.apache.spark.sql.catalyst.analysis.{SimpleAnalyzer, UnresolvedExtractValue}
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.Cross
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.RuleExecutor
-import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
+import org.apache.spark.sql.types.{ArrayType, IntegerType, StringType, StructField, StructType}
 
 class NestedColumnAliasingSuite extends SchemaPruningTest {
 
@@ -762,6 +763,90 @@ class NestedColumnAliasingSuite extends SchemaPruningTest {
         $"_extract_search_params.col1".as("col1"),
         $"_extract_search_params.col2".as("col2")).analyze
     comparePlans(optimized, query)
+  }
+
+  test("SPARK-36677: NestedColumnAliasing should not push down aggregate functions into " +
+    "projections") {
+    val nestedRelation = LocalRelation(
+      'a.struct(
+        'c.struct(
+          'e.string),
+        'd.string),
+      'b.string)
+
+    val plan = nestedRelation
+      .select($"a", $"b")
+      .groupBy($"b")(max($"a").getField("c").getField("e"))
+      .analyze
+
+    val optimized = Optimize.execute(plan)
+
+    // The plan should not contain aggregation functions inside the projection
+    SimpleAnalyzer.checkAnalysis(optimized)
+
+    val expected = nestedRelation
+      .groupBy($"b")(max($"a").getField("c").getField("e"))
+      .analyze
+
+    comparePlans(optimized, expected)
+  }
+
+  test("SPARK-37904: Improve rebalance in NestedColumnAliasing") {
+    // alias nested columns through rebalance
+    val plan1 = contact.rebalance($"id").select($"name.first").analyze
+    val optimized1 = Optimize.execute(plan1)
+    val expected1 = contact.select($"id", $"name.first".as("_extract_first"))
+      .rebalance($"id").select($"_extract_first".as("first")).analyze
+    comparePlans(optimized1, expected1)
+
+    // also alias rebalance nested columns
+    val plan2 = contact.rebalance($"name.first").select($"name.first").analyze
+    val optimized2 = Optimize.execute(plan2)
+    val expected2 = contact.select($"name.first".as("_extract_first"))
+      .rebalance($"_extract_first".as("first")).select($"_extract_first".as("first")).analyze
+    comparePlans(optimized2, expected2)
+
+    // do not alias nested columns if its child contains root reference
+    val plan3 = contact.rebalance($"name").select($"name.first").analyze
+    val optimized3 = Optimize.execute(plan3)
+    val expected3 = contact.select($"name").rebalance($"name").select($"name.first").analyze
+    comparePlans(optimized3, expected3)
+  }
+
+  test("SPARK-38530: Do not push down nested ExtractValues with other expressions") {
+    val inputType = StructType.fromDDL(
+      "a int, b struct<c: array<int>, c2: int>")
+    val simpleStruct = StructType.fromDDL(
+      "b struct<c: struct<d: int, e: int>, c2 int>"
+    )
+    val input = LocalRelation(
+      'id.int,
+      'col1.array(ArrayType(inputType)))
+
+    val query = input
+      .generate(Explode('col1))
+      .select(
+        UnresolvedExtractValue(
+          UnresolvedExtractValue(
+            CaseWhen(Seq(('col.getField("a") === 1,
+              Literal.default(simpleStruct)))),
+            Literal("b")),
+          Literal("c")).as("result"))
+      .analyze
+    val optimized = Optimize.execute(query)
+
+    val aliases = collectGeneratedAliases(optimized)
+
+    // Only the inner-most col.a should be pushed down.
+    val expected = input
+      .select('col1.getField("a").as(aliases(0)))
+      .generate(Explode($"${aliases(0)}"), unrequiredChildIndex = Seq(0))
+      .select(UnresolvedExtractValue(UnresolvedExtractValue(
+        CaseWhen(Seq(('col === 1,
+          Literal.default(simpleStruct)))), Literal("b")), Literal("c")).as("result"))
+      .analyze
+
+    comparePlans(optimized, expected)
   }
 }
 

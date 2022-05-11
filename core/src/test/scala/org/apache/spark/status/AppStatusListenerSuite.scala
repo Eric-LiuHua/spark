@@ -28,6 +28,7 @@ import org.scalatest.BeforeAndAfter
 
 import org.apache.spark._
 import org.apache.spark.executor.{ExecutorMetrics, TaskMetrics}
+import org.apache.spark.internal.config.History.{HYBRID_STORE_DISK_BACKEND, HybridStoreDiskBackend}
 import org.apache.spark.internal.config.Status._
 import org.apache.spark.metrics.ExecutorMetricType
 import org.apache.spark.resource.ResourceProfile
@@ -36,12 +37,11 @@ import org.apache.spark.scheduler.cluster._
 import org.apache.spark.status.ListenerEventsTestHelper._
 import org.apache.spark.status.api.v1
 import org.apache.spark.storage._
+import org.apache.spark.tags.{ExtendedLevelDBTest, ExtendedRocksDBTest}
 import org.apache.spark.util.Utils
+import org.apache.spark.util.kvstore.{InMemoryStore, KVStore}
 
-class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
-  private val conf = new SparkConf()
-    .set(LIVE_ENTITY_UPDATE_PERIOD, 0L)
-    .set(ASYNC_TRACKING_ENABLED, false)
+abstract class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
 
   private val twoReplicaMemAndDiskLevel = StorageLevel(true, true, false, true, 2)
 
@@ -50,10 +50,16 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
   private var store: ElementTrackingStore = _
   private var taskIdTracker = -1L
 
+  protected def conf: SparkConf = new SparkConf()
+    .set(LIVE_ENTITY_UPDATE_PERIOD, 0L)
+    .set(ASYNC_TRACKING_ENABLED, false)
+
+  protected def createKVStore: KVStore = KVUtils.open(testDir, getClass().getName(), conf)
+
   before {
     time = 0L
     testDir = Utils.createTempDir()
-    store = new ElementTrackingStore(KVUtils.open(testDir, getClass().getName()), conf)
+    store = new ElementTrackingStore(createKVStore, conf)
     taskIdTracker = -1L
   }
 
@@ -341,6 +347,11 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(task.attempt === reattempt.attemptNumber)
     }
 
+    check[SpeculationStageSummaryWrapper](key(stages.head)) { stage =>
+      assert(stage.info.numActiveTasks == 2)
+      assert(stage.info.numTasks == 2)
+    }
+
     // Kill one task, restart it.
     time += 1
     val killed = s1Tasks.drop(1).head
@@ -423,6 +434,11 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(stage.info.numKilledTasks === 2)
       assert(stage.info.numActiveTasks === 0)
       assert(stage.info.numCompleteTasks === pending.size)
+    }
+
+    check[SpeculationStageSummaryWrapper](key(stages.head)) { stage =>
+      assert(stage.info.numCompletedTasks == 2)
+      assert(stage.info.numKilledTasks == 2)
     }
 
     pending.foreach { task =>
@@ -1844,7 +1860,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
 
   private def newAttempt(orig: TaskInfo, nextId: Long): TaskInfo = {
     // Task reattempts have a different ID, but the same index as the original.
-    new TaskInfo(nextId, orig.index, orig.attemptNumber + 1, time, orig.executorId,
+    new TaskInfo(
+      nextId, orig.index, orig.attemptNumber + 1, orig.partitionId, time, orig.executorId,
       s"${orig.executorId}.example.com", TaskLocality.PROCESS_LOCAL, orig.speculative)
   }
 
@@ -1852,7 +1869,9 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
     (1 to count).map { id =>
       val exec = execs(id.toInt % execs.length)
       val taskId = nextTaskId()
-      new TaskInfo(taskId, taskId.toInt, 1, time, exec, s"$exec.example.com",
+      val taskIndex = id - 1
+      val partitionId = taskIndex
+      new TaskInfo(taskId, taskIndex, 1, partitionId, time, exec, s"$exec.example.com",
         TaskLocality.PROCESS_LOCAL, id % 2 == 0)
     }
   }
@@ -1871,4 +1890,20 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
     def blockId: BlockId = RDDBlockId(rddId, partId)
 
   }
+}
+
+class AppStatusListenerWithInMemoryStoreSuite extends AppStatusListenerSuite {
+  override def createKVStore: KVStore = new InMemoryStore()
+}
+
+@ExtendedLevelDBTest
+class AppStatusListenerWithLevelDBSuite extends AppStatusListenerSuite {
+  override def conf: SparkConf = super.conf
+    .set(HYBRID_STORE_DISK_BACKEND, HybridStoreDiskBackend.LEVELDB.toString)
+}
+
+@ExtendedRocksDBTest
+class AppStatusListenerWithRocksDBSuite extends AppStatusListenerSuite {
+  override def conf: SparkConf = super.conf
+    .set(HYBRID_STORE_DISK_BACKEND, HybridStoreDiskBackend.ROCKSDB.toString)
 }

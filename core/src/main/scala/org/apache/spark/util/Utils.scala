@@ -44,7 +44,7 @@ import scala.util.control.{ControlThrowable, NonFatal}
 import scala.util.matching.Regex
 
 import _root_.io.netty.channel.unix.Errors.NativeIoException
-import com.github.benmanes.caffeine.cache.{CacheLoader, Caffeine, LoadingCache}
+import com.google.common.cache.{CacheBuilder, CacheLoader, LoadingCache}
 import com.google.common.collect.Interners
 import com.google.common.io.{ByteStreams, Files => GFiles}
 import com.google.common.net.InetAddresses
@@ -57,6 +57,8 @@ import org.apache.hadoop.io.compress.{CompressionCodecFactory, SplittableCompres
 import org.apache.hadoop.security.UserGroupInformation
 import org.apache.hadoop.util.{RunJar, StringUtils}
 import org.apache.hadoop.yarn.conf.YarnConfiguration
+import org.apache.logging.log4j.{Level, LogManager}
+import org.apache.logging.log4j.core.LoggerContext
 import org.eclipse.jetty.util.MultiException
 import org.slf4j.Logger
 
@@ -70,7 +72,7 @@ import org.apache.spark.internal.config.UI._
 import org.apache.spark.internal.config.Worker._
 import org.apache.spark.launcher.SparkLauncher
 import org.apache.spark.network.util.JavaUtils
-import org.apache.spark.serializer.{DeserializationStream, SerializationStream, SerializerInstance}
+import org.apache.spark.serializer.{DeserializationStream, SerializationStream, Serializer, SerializerInstance}
 import org.apache.spark.status.api.v1.{StackTrace, ThreadStackTrace}
 import org.apache.spark.util.io.ChunkedByteBufferOutputStream
 
@@ -353,26 +355,26 @@ private[spark] object Utils extends Logging {
       closeStreams: Boolean = false,
       transferToEnabled: Boolean = false): Long = {
     tryWithSafeFinally {
-      if (in.isInstanceOf[FileInputStream] && out.isInstanceOf[FileOutputStream]
-        && transferToEnabled) {
-        // When both streams are File stream, use transferTo to improve copy performance.
-        val inChannel = in.asInstanceOf[FileInputStream].getChannel()
-        val outChannel = out.asInstanceOf[FileOutputStream].getChannel()
-        val size = inChannel.size()
-        copyFileStreamNIO(inChannel, outChannel, 0, size)
-        size
-      } else {
-        var count = 0L
-        val buf = new Array[Byte](8192)
-        var n = 0
-        while (n != -1) {
-          n = in.read(buf)
-          if (n != -1) {
-            out.write(buf, 0, n)
-            count += n
+      (in, out) match {
+        case (input: FileInputStream, output: FileOutputStream) if transferToEnabled =>
+          // When both streams are File stream, use transferTo to improve copy performance.
+          val inChannel = input.getChannel
+          val outChannel = output.getChannel
+          val size = inChannel.size()
+          copyFileStreamNIO(inChannel, outChannel, 0, size)
+          size
+        case (input, output) =>
+          var count = 0L
+          val buf = new Array[Byte](8192)
+          var n = 0
+          while (n != -1) {
+            n = input.read(buf)
+            if (n != -1) {
+              output.write(buf, 0, n)
+              count += n
+            }
           }
-        }
-        count
+          count
       }
     } {
       if (closeStreams) {
@@ -591,17 +593,46 @@ private[spark] object Utils extends Logging {
    * basically copied from `org.apache.hadoop.yarn.util.FSDownload.unpack`.
    */
   def unpack(source: File, dest: File): Unit = {
+    if (!source.exists()) {
+      throw new FileNotFoundException(source.getAbsolutePath)
+    }
     val lowerSrc = StringUtils.toLowerCase(source.getName)
     if (lowerSrc.endsWith(".jar")) {
       RunJar.unJar(source, dest, RunJar.MATCH_ANY)
     } else if (lowerSrc.endsWith(".zip")) {
+      // TODO(SPARK-37677): should keep file permissions. Java implementation doesn't.
       FileUtil.unZip(source, dest)
-    } else if (
-      lowerSrc.endsWith(".tar.gz") || lowerSrc.endsWith(".tgz") || lowerSrc.endsWith(".tar")) {
+    } else if (lowerSrc.endsWith(".tar.gz") || lowerSrc.endsWith(".tgz")) {
       FileUtil.unTar(source, dest)
+    } else if (lowerSrc.endsWith(".tar")) {
+      // TODO(SPARK-38632): should keep file permissions. Java implementation doesn't.
+      unTarUsingJava(source, dest)
     } else {
       logWarning(s"Cannot unpack $source, just copying it to $dest.")
       copyRecursive(source, dest)
+    }
+  }
+
+  /**
+   * The method below was copied from `FileUtil.unTar` but uses Java-based implementation
+   * to work around a security issue, see also SPARK-38631.
+   */
+  private def unTarUsingJava(source: File, dest: File): Unit = {
+    if (!dest.mkdirs && !dest.isDirectory) {
+      throw new IOException(s"Mkdirs failed to create $dest")
+    } else {
+      try {
+        // Should not fail because all Hadoop 2.1+ (from HADOOP-9264)
+        // have 'unTarUsingJava'.
+        val mth = classOf[FileUtil].getDeclaredMethod(
+          "unTarUsingJava", classOf[File], classOf[File], classOf[Boolean])
+        mth.setAccessible(true)
+        mth.invoke(null, source, dest, java.lang.Boolean.FALSE)
+      } catch {
+        // Re-throw the original exception.
+        case e: java.lang.reflect.InvocationTargetException if e.getCause != null =>
+          throw e.getCause
+      }
     }
   }
 
@@ -871,6 +902,11 @@ private[spark] object Utils extends Logging {
     // These environment variables are set by YARN.
     conf.getenv("CONTAINER_ID") != null
   }
+
+  /**
+   * Returns if the current codes are running in a Spark task, e.g., in executors.
+   */
+  def isInRunningSparkTask: Boolean = TaskContext.get() != null
 
   /**
    * Gets or creates the directories listed in spark.local.dir or SPARK_LOCAL_DIRS,
@@ -1616,16 +1652,13 @@ private[spark] object Utils extends Logging {
     if (compressedLogFileLengthCache == null) {
       val compressedLogFileLengthCacheSize = sparkConf.get(
         UNCOMPRESSED_LOG_FILE_LENGTH_CACHE_SIZE_CONF)
-      compressedLogFileLengthCache = {
-        val builder = Caffeine.newBuilder()
-          .maximumSize(compressedLogFileLengthCacheSize)
-        builder.build[String, java.lang.Long](
-          new CacheLoader[String, java.lang.Long]() {
-            override def load(path: String): java.lang.Long = {
-              Utils.getCompressedFileLength(new File(path))
-            }
-          })
-      }
+      compressedLogFileLengthCache = CacheBuilder.newBuilder()
+        .maximumSize(compressedLogFileLengthCacheSize)
+        .build[String, java.lang.Long](new CacheLoader[String, java.lang.Long]() {
+        override def load(path: String): java.lang.Long = {
+          Utils.getCompressedFileLength(new File(path))
+        }
+      })
     }
     compressedLogFileLengthCache
   }
@@ -1963,6 +1996,11 @@ private[spark] object Utils extends Logging {
    * Whether the underlying operating system is Mac OS X.
    */
   val isMac = SystemUtils.IS_OS_MAC_OSX
+
+  /**
+   * Whether the underlying operating system is Mac OS X and processor is Apple Silicon.
+   */
+  val isMacOnAppleSilicon = SystemUtils.IS_OS_MAC_OSX && SystemUtils.OS_ARCH.equals("aarch64")
 
   /**
    * Pattern for matching a Windows drive, which contains only a single alphabet character.
@@ -2421,9 +2459,13 @@ private[spark] object Utils extends Logging {
   /**
    * configure a new log4j level
    */
-  def setLogLevel(l: org.apache.log4j.Level): Unit = {
-    val rootLogger = org.apache.log4j.Logger.getRootLogger()
-    rootLogger.setLevel(l)
+  def setLogLevel(l: Level): Unit = {
+    val ctx = LogManager.getContext(false).asInstanceOf[LoggerContext]
+    val config = ctx.getConfiguration()
+    val loggerConfig = config.getLoggerConfig(LogManager.ROOT_LOGGER_NAME)
+    loggerConfig.setLevel(l)
+    ctx.updateLoggers()
+
     // Setting threshold to null as rootLevel will define log level for spark-shell
     Logging.sparkShellThresholdLevel = null
   }
@@ -2600,14 +2642,79 @@ private[spark] object Utils extends Logging {
   }
 
   /**
-   * Push based shuffle can only be enabled when the application is submitted
-   * to run in YARN mode, with external shuffle service enabled
+   * Push based shuffle can only be enabled when below conditions are met:
+   *   - the application is submitted to run in YARN mode
+   *   - external shuffle service enabled
+   *   - IO encryption disabled
+   *   - serializer(such as KryoSerializer) supports relocation of serialized objects
    */
-  def isPushBasedShuffleEnabled(conf: SparkConf): Boolean = {
-    conf.get(PUSH_BASED_SHUFFLE_ENABLED) &&
-      (conf.get(IS_TESTING).getOrElse(false) ||
-        (conf.get(SHUFFLE_SERVICE_ENABLED) &&
-          conf.get(SparkLauncher.SPARK_MASTER, null) == "yarn"))
+  def isPushBasedShuffleEnabled(conf: SparkConf,
+      isDriver: Boolean,
+      checkSerializer: Boolean = true): Boolean = {
+    val pushBasedShuffleEnabled = conf.get(PUSH_BASED_SHUFFLE_ENABLED)
+    if (pushBasedShuffleEnabled) {
+      val canDoPushBasedShuffle = {
+        val isTesting = conf.get(IS_TESTING).getOrElse(false)
+        val isShuffleServiceAndYarn = conf.get(SHUFFLE_SERVICE_ENABLED) &&
+            conf.get(SparkLauncher.SPARK_MASTER, null) == "yarn"
+        lazy val serializerIsSupported = {
+          if (checkSerializer) {
+            Option(SparkEnv.get)
+              .map(_.serializer)
+              .filter(_ != null)
+              .getOrElse(instantiateSerializerFromConf[Serializer](SERIALIZER, conf, isDriver))
+              .supportsRelocationOfSerializedObjects
+          } else {
+            // if no need to check Serializer, always set serializerIsSupported as true
+            true
+          }
+        }
+        // TODO: [SPARK-36744] needs to support IO encryption for push-based shuffle
+        val ioEncryptionDisabled = !conf.get(IO_ENCRYPTION_ENABLED)
+        (isShuffleServiceAndYarn || isTesting) && ioEncryptionDisabled && serializerIsSupported
+      }
+      if (!canDoPushBasedShuffle) {
+        logWarning("Push-based shuffle can only be enabled when the application is submitted " +
+          "to run in YARN mode, with external shuffle service enabled, IO encryption disabled, " +
+          "and relocation of serialized objects supported.")
+      }
+
+      canDoPushBasedShuffle
+    } else {
+      false
+    }
+  }
+
+  // Create an instance of Serializer or ShuffleManager with the given name,
+  // possibly initializing it with our conf
+  def instantiateSerializerOrShuffleManager[T](className: String,
+      conf: SparkConf,
+      isDriver: Boolean): T = {
+    val cls = Utils.classForName(className)
+    // Look for a constructor taking a SparkConf and a boolean isDriver, then one taking just
+    // SparkConf, then one taking no arguments
+    try {
+      cls.getConstructor(classOf[SparkConf], java.lang.Boolean.TYPE)
+        .newInstance(conf, java.lang.Boolean.valueOf(isDriver))
+        .asInstanceOf[T]
+    } catch {
+      case _: NoSuchMethodException =>
+        try {
+          cls.getConstructor(classOf[SparkConf]).newInstance(conf).asInstanceOf[T]
+        } catch {
+          case _: NoSuchMethodException =>
+            cls.getConstructor().newInstance().asInstanceOf[T]
+        }
+    }
+  }
+
+  // Create an instance of Serializer named by the given SparkConf property
+  // if the property is not set, possibly initializing it with our conf
+  def instantiateSerializerFromConf[T](propertyName: ConfigEntry[String],
+      conf: SparkConf,
+      isDriver: Boolean): T = {
+    instantiateSerializerOrShuffleManager[T](
+      conf.get(propertyName), conf, isDriver)
   }
 
   /**
@@ -2823,7 +2930,7 @@ private[spark] object Utils extends Logging {
             klass.getConstructor().newInstance()
         }
 
-        Some(ext.asInstanceOf[T])
+        Some(ext)
       } catch {
         case _: NoSuchMethodException =>
           throw new SparkException(
@@ -2961,6 +3068,7 @@ private[spark] object Utils extends Logging {
    * Remove trailing dollar signs from qualified class name,
    * and return the trailing part after the last dollar sign in the middle
    */
+  @scala.annotation.tailrec
   private def stripDollars(s: String): String = {
     val lastDollarIndex = s.lastIndexOf('$')
     if (lastDollarIndex < s.length - 1) {
@@ -3099,13 +3207,6 @@ private[spark] object Utils extends Logging {
     }
   }
 
-  def executorTimeoutMs(conf: SparkConf): Long = {
-    // "spark.network.timeout" uses "seconds", while `spark.storage.blockManagerSlaveTimeoutMs` uses
-    // "milliseconds"
-    conf.get(config.STORAGE_BLOCKMANAGER_HEARTBEAT_TIMEOUT)
-      .getOrElse(Utils.timeStringAsMs(s"${conf.get(Network.NETWORK_TIMEOUT)}s"))
-  }
-
   /** Returns a string message about delegation token generation failure */
   def createFailedToGetTokenMessage(serviceName: String, e: scala.Throwable): String = {
     val message = "Failed to get token from service %s due to %s. " +
@@ -3143,6 +3244,23 @@ private[spark] object Utils extends Logging {
       IOUtils.closeQuietly(out)
     }
     files.toSeq
+  }
+
+  /**
+   * Return the median number of a long array
+   *
+   * @param sizes
+   * @param alreadySorted
+   * @return
+   */
+  def median(sizes: Array[Long], alreadySorted: Boolean): Long = {
+    val len = sizes.length
+    val sortedSize = if (alreadySorted) sizes else sizes.sorted
+    len match {
+      case _ if (len % 2 == 0) =>
+        math.max((sortedSize(len / 2) + sortedSize(len / 2 - 1)) / 2, 1)
+      case _ => math.max(sortedSize(len / 2), 1)
+    }
   }
 }
 

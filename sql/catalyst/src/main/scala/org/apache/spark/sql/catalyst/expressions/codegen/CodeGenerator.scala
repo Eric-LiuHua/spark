@@ -20,12 +20,13 @@ package org.apache.spark.sql.catalyst.expressions.codegen
 import java.io.ByteArrayInputStream
 import java.util.{Map => JavaMap}
 
+import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.util.control.NonFatal
 
-import com.github.benmanes.caffeine.cache.{CacheLoader, Caffeine}
+import com.google.common.cache.{CacheBuilder, CacheLoader}
 import com.google.common.util.concurrent.{ExecutionError, UncheckedExecutionException}
 import org.codehaus.commons.compiler.CompileException
 import org.codehaus.janino.{ByteArrayClassLoader, ClassBodyEvaluator, InternalCompilerException, SimpleCompiler}
@@ -347,7 +348,7 @@ class CodegenContext extends Logging {
    */
   def addBufferedState(dataType: DataType, variableName: String, initCode: String): ExprCode = {
     val value = addMutableState(javaType(dataType), variableName)
-    val code = dataType match {
+    val code = UserDefinedType.sqlType(dataType) match {
       case StringType => code"$value = $initCode.clone();"
       case _: StructType | _: ArrayType | _: MapType => code"$value = $initCode.copy();"
       case _ => code"$value = $initCode;"
@@ -650,7 +651,7 @@ class CodegenContext extends Logging {
       s"$clsName.compareFloats($c1, $c2)"
     // use c1 - c2 may overflow
     case dt: DataType if isPrimitiveType(dt) => s"($c1 > $c2 ? 1 : $c1 < $c2 ? -1 : 0)"
-    case BinaryType => s"org.apache.spark.sql.catalyst.util.TypeUtils.compareBinary($c1, $c2)"
+    case BinaryType => s"org.apache.spark.unsafe.types.ByteArray.compareBinary($c1, $c2)"
     case NullType => "0"
     case array: ArrayType =>
       val elementType = array.elementType
@@ -1577,9 +1578,9 @@ object CodeGenerator extends Logging {
    * automatically, in order to constrain its memory footprint.  Note that this cache does not use
    * weak keys/values and thus does not respond to memory pressure.
    */
-  private val cache = Caffeine.newBuilder()
+  private val cache = CacheBuilder.newBuilder()
     .maximumSize(SQLConf.get.codegenCacheMaxEntries)
-    .build[CodeAndComment, (GeneratedClass, ByteCodeStats)](
+    .build(
       new CacheLoader[CodeAndComment, (GeneratedClass, ByteCodeStats)]() {
         override def load(code: CodeAndComment): (GeneratedClass, ByteCodeStats) = {
           val startTime = System.nanoTime()
@@ -1622,6 +1623,7 @@ object CodeGenerator extends Logging {
   /**
    * Returns the specialized code to access a value from `inputRow` at `ordinal`.
    */
+  @tailrec
   def getValue(input: String, dataType: DataType, ordinal: String): String = {
     val jt = javaType(dataType)
     dataType match {
@@ -1695,6 +1697,7 @@ object CodeGenerator extends Logging {
   /**
    * Returns the code to update a column in Row for a given DataType.
    */
+  @tailrec
   def setColumn(row: String, dataType: DataType, ordinal: Int, value: String): String = {
     val jt = javaType(dataType)
     dataType match {
@@ -1918,6 +1921,7 @@ object CodeGenerator extends Logging {
     case _ => "Object"
   }
 
+  @tailrec
   def javaClass(dt: DataType): Class[_] = dt match {
     case BooleanType => java.lang.Boolean.TYPE
     case ByteType => java.lang.Byte.TYPE

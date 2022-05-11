@@ -39,6 +39,7 @@ import org.apache.spark.scheduler.{SparkListener, SparkListenerStageCompleted}
 import org.apache.spark.sql.{DataFrame, Encoder, Row, SparkSession}
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.functions.{col, lit}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.StreamingQueryException
 import org.apache.spark.sql.types._
 import org.apache.spark.storage.StorageLevel
@@ -188,7 +189,7 @@ class ALSSuite extends MLTest with DefaultReadWriteTest with Logging {
     assert(compressed.size === 5)
     assert(compressed.srcIds.toSeq === Seq(0, 1, 2, 3))
     assert(compressed.dstPtrs.toSeq === Seq(0, 2, 3, 4, 5))
-    var decompressed = ArrayBuffer.empty[(Int, Int, Int, Float)]
+    val decompressed = ArrayBuffer.empty[(Int, Int, Int, Float)]
     var i = 0
     while (i < compressed.srcIds.length) {
       var j = compressed.dstPtrs(i)
@@ -213,7 +214,9 @@ class ALSSuite extends MLTest with DefaultReadWriteTest with Logging {
     }
 
     withClue("Valid Long Ids") {
-      df.select(checkedCast(lit(1231L))).collect()
+      withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
+        df.select(checkedCast(lit(1231L))).collect()
+      }
     }
 
     withClue("Valid Decimal Ids") {
@@ -225,18 +228,20 @@ class ALSSuite extends MLTest with DefaultReadWriteTest with Logging {
     }
 
     val msg = "either out of Integer range or contained a fractional part"
-    withClue("Invalid Long: out of range") {
-      val e: SparkException = intercept[SparkException] {
-        df.select(checkedCast(lit(1231000000000L))).collect()
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
+      withClue("Invalid Long: out of range") {
+        val e: SparkException = intercept[SparkException] {
+          df.select(checkedCast(lit(1231000000000L))).collect()
+        }
+        assert(e.getMessage.contains(msg))
       }
-      assert(e.getMessage.contains(msg))
-    }
 
-    withClue("Invalid Decimal: out of range") {
-      val e: SparkException = intercept[SparkException] {
-        df.select(checkedCast(lit(1231000000000.0).cast(DecimalType(15, 2)))).collect()
+      withClue("Invalid Decimal: out of range") {
+        val e: SparkException = intercept[SparkException] {
+          df.select(checkedCast(lit(1231000000000.0).cast(DecimalType(15, 2)))).collect()
+        }
+        assert(e.getMessage.contains(msg))
       }
-      assert(e.getMessage.contains(msg))
     }
 
     withClue("Invalid Decimal: fractional part") {
@@ -246,11 +251,13 @@ class ALSSuite extends MLTest with DefaultReadWriteTest with Logging {
       assert(e.getMessage.contains(msg))
     }
 
-    withClue("Invalid Double: out of range") {
-      val e: SparkException = intercept[SparkException] {
-        df.select(checkedCast(lit(1231000000000.0))).collect()
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
+      withClue("Invalid Double: out of range") {
+        val e: SparkException = intercept[SparkException] {
+          df.select(checkedCast(lit(1231000000000.0))).collect()
+        }
+        assert(e.getMessage.contains(msg))
       }
-      assert(e.getMessage.contains(msg))
     }
 
     withClue("Invalid Double: fractional part") {
@@ -677,40 +684,42 @@ class ALSSuite extends MLTest with DefaultReadWriteTest with Logging {
       (1, 1L, 1d, 0, 0L, 0d, 5.0)
     ).toDF("user", "user_big", "user_small", "item", "item_big", "item_small", "rating")
     val msg = "either out of Integer range or contained a fractional part"
-    withClue("fit should fail when ids exceed integer range. ") {
-      assert(intercept[SparkException] {
-        als.fit(df.select(df("user_big").as("user"), df("item"), df("rating")))
-      }.getCause.getMessage.contains(msg))
-      assert(intercept[SparkException] {
-        als.fit(df.select(df("user_small").as("user"), df("item"), df("rating")))
-      }.getCause.getMessage.contains(msg))
-      assert(intercept[SparkException] {
-        als.fit(df.select(df("item_big").as("item"), df("user"), df("rating")))
-      }.getCause.getMessage.contains(msg))
-      assert(intercept[SparkException] {
-        als.fit(df.select(df("item_small").as("item"), df("user"), df("rating")))
-      }.getCause.getMessage.contains(msg))
-    }
-    withClue("transform should fail when ids exceed integer range. ") {
-      val model = als.fit(df)
-      def testTransformIdExceedsIntRange[A : Encoder](dataFrame: DataFrame): Unit = {
-        val e1 = intercept[SparkException] {
-          model.transform(dataFrame).collect()
-        }
-        TestUtils.assertExceptionMsg(e1, msg)
-        val e2 = intercept[StreamingQueryException] {
-          testTransformer[A](dataFrame, model, "prediction") { _ => }
-        }
-        TestUtils.assertExceptionMsg(e2, msg)
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
+      withClue("fit should fail when ids exceed integer range. ") {
+        assert(intercept[SparkException] {
+          als.fit(df.select(df("user_big").as("user"), df("item"), df("rating")))
+        }.getCause.getMessage.contains(msg))
+        assert(intercept[SparkException] {
+          als.fit(df.select(df("user_small").as("user"), df("item"), df("rating")))
+        }.getCause.getMessage.contains(msg))
+        assert(intercept[SparkException] {
+          als.fit(df.select(df("item_big").as("item"), df("user"), df("rating")))
+        }.getCause.getMessage.contains(msg))
+        assert(intercept[SparkException] {
+          als.fit(df.select(df("item_small").as("item"), df("user"), df("rating")))
+        }.getCause.getMessage.contains(msg))
       }
-      testTransformIdExceedsIntRange[(Long, Int)](df.select(df("user_big").as("user"),
-        df("item")))
-      testTransformIdExceedsIntRange[(Double, Int)](df.select(df("user_small").as("user"),
-        df("item")))
-      testTransformIdExceedsIntRange[(Long, Int)](df.select(df("item_big").as("item"),
-        df("user")))
-      testTransformIdExceedsIntRange[(Double, Int)](df.select(df("item_small").as("item"),
-        df("user")))
+      withClue("transform should fail when ids exceed integer range. ") {
+        val model = als.fit(df)
+        def testTransformIdExceedsIntRange[A : Encoder](dataFrame: DataFrame): Unit = {
+          val e1 = intercept[SparkException] {
+            model.transform(dataFrame).collect()
+          }
+          TestUtils.assertExceptionMsg(e1, msg)
+          val e2 = intercept[StreamingQueryException] {
+            testTransformer[A](dataFrame, model, "prediction") { _ => }
+          }
+          TestUtils.assertExceptionMsg(e2, msg)
+        }
+        testTransformIdExceedsIntRange[(Long, Int)](df.select(df("user_big").as("user"),
+          df("item")))
+        testTransformIdExceedsIntRange[(Double, Int)](df.select(df("user_small").as("user"),
+          df("item")))
+        testTransformIdExceedsIntRange[(Long, Int)](df.select(df("item_big").as("item"),
+          df("user")))
+        testTransformIdExceedsIntRange[(Double, Int)](df.select(df("item_small").as("item"),
+          df("user")))
+      }
     }
   }
 

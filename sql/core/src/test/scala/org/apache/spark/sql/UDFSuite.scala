@@ -424,7 +424,7 @@ class UDFSuite extends QueryTest with SharedSparkSession {
       ("N", Integer.valueOf(3), null)).toDF("a", "b", "c")
 
     val udf1 = udf((a: String, b: Int, c: Any) => a + b + c)
-    val df = input.select(udf1('a, 'b, 'c))
+    val df = input.select(udf1(Symbol("a"), 'b, 'c))
     checkAnswer(df, Seq(Row("null1x"), Row(null), Row("N3null")))
 
     // test Java UDF. Java UDF can't have primitive inputs, as it's generic typed.
@@ -554,7 +554,7 @@ class UDFSuite extends QueryTest with SharedSparkSession {
     spark.udf.register("buildLocalDateInstantType",
       udf((d: LocalDate, i: Instant) => LocalDateInstantType(d, i)))
     checkAnswer(df.selectExpr(s"buildLocalDateInstantType(d, i) as di")
-      .select('di.cast(StringType)),
+      .select(Symbol("di").cast(StringType)),
       Row(s"{$expectedDate, $expectedInstant}") :: Nil)
 
     // test null cases
@@ -584,7 +584,7 @@ class UDFSuite extends QueryTest with SharedSparkSession {
     spark.udf.register("buildTimestampInstantType",
       udf((t: Timestamp, i: Instant) => TimestampInstantType(t, i)))
     checkAnswer(df.selectExpr("buildTimestampInstantType(t, i) as ti")
-      .select('ti.cast(StringType)),
+      .select(Symbol("ti").cast(StringType)),
       Row(s"{$expectedTimestamp, $expectedInstant}"))
 
     // test null cases
@@ -730,7 +730,8 @@ class UDFSuite extends QueryTest with SharedSparkSession {
       .select(lit(50).as("a"))
       .select(struct("a").as("col"))
     val error = intercept[AnalysisException](df.select(myUdf(Column("col"))))
-    assert(error.getMessage.contains("cannot resolve 'b' given input columns: [a]"))
+    assert(error.getErrorClass == "MISSING_COLUMN")
+    assert(error.messageParameters.sameElements(Array("b", "a")))
   }
 
   test("wrong order of input fields for case class") {
@@ -845,34 +846,6 @@ class UDFSuite extends QueryTest with SharedSparkSession {
       FunctionIdentifier("udaf34388"), Seq(Literal(1))) match {
       case udaf: ScalaUDAF => assert(udaf.name === "udaf34388")
     }
-  }
-
-  test("SPARK-35674: using java.time.LocalDateTime in UDF") {
-    // Regular case
-    val input = Seq(java.time.LocalDateTime.parse("2021-01-01T00:00:00")).toDF("dateTime")
-    val plusYear = udf((l: java.time.LocalDateTime) => l.plusYears(1))
-    val result = input.select(plusYear($"dateTime").as("newDateTime"))
-    checkAnswer(result, Row(java.time.LocalDateTime.parse("2022-01-01T00:00:00")) :: Nil)
-    assert(result.schema === new StructType().add("newDateTime", TimestampNTZType))
-    // UDF produces `null`
-    val nullFunc = udf((_: java.time.LocalDateTime) => null.asInstanceOf[java.time.LocalDateTime])
-    val nullResult = input.select(nullFunc($"dateTime").as("nullDateTime"))
-    checkAnswer(nullResult, Row(null) :: Nil)
-    assert(nullResult.schema === new StructType().add("nullDateTime", TimestampNTZType))
-    // Input parameter of UDF is null
-    val nullInput = Seq(null.asInstanceOf[java.time.LocalDateTime]).toDF("nullDateTime")
-    val constDuration = udf((_: java.time.LocalDateTime) =>
-      java.time.LocalDateTime.parse("2021-01-01T00:00:00"))
-    val constResult = nullInput.select(constDuration($"nullDateTime").as("firstDayOf2021"))
-    checkAnswer(constResult, Row(java.time.LocalDateTime.parse("2021-01-01T00:00:00")) :: Nil)
-    assert(constResult.schema === new StructType().add("firstDayOf2021", TimestampNTZType))
-    // Error in the conversion of UDF result to the internal representation of timestamp without
-    // time zone
-    val overflowFunc = udf((l: java.time.LocalDateTime) => l.plusDays(Long.MaxValue))
-    val e = intercept[SparkException] {
-      input.select(overflowFunc($"dateTime")).collect()
-    }.getCause.getCause
-    assert(e.isInstanceOf[java.lang.ArithmeticException])
   }
 
   test("SPARK-34663, SPARK-35730: using java.time.Duration in UDF") {

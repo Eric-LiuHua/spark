@@ -87,7 +87,7 @@ public class RemoteBlockPushResolverSuite {
   public void before() throws IOException {
     localDirs = createLocalDirs(2);
     MapConfigProvider provider = new MapConfigProvider(
-      ImmutableMap.of("spark.shuffle.server.minChunkSizeInMergedShuffleFile", "4"));
+      ImmutableMap.of("spark.shuffle.push.server.minChunkSizeInMergedShuffleFile", "4"));
     conf = new TransportConf("shuffle", provider);
     pushResolver = new RemoteBlockPushResolver(conf);
     registerExecutor(TEST_APP, prepareLocalDirs(localDirs, MERGE_DIRECTORY), MERGE_DIRECTORY_META);
@@ -111,6 +111,8 @@ public class RemoteBlockPushResolverSuite {
     ErrorHandler.BlockPushErrorHandler errorHandler = RemoteBlockPushResolver.createErrorHandler();
     assertFalse(errorHandler.shouldLogError(new BlockPushNonFatalFailure(
       BlockPushNonFatalFailure.ReturnCode.TOO_LATE_BLOCK_PUSH, "")));
+    assertFalse(errorHandler.shouldLogError(new BlockPushNonFatalFailure(
+      BlockPushNonFatalFailure.ReturnCode.TOO_OLD_ATTEMPT_PUSH, "")));
     assertFalse(errorHandler.shouldLogError(new BlockPushNonFatalFailure(
       BlockPushNonFatalFailure.ReturnCode.STALE_BLOCK_PUSH, "")));
     assertFalse(errorHandler.shouldLogError(new BlockPushNonFatalFailure(
@@ -939,7 +941,7 @@ public class RemoteBlockPushResolverSuite {
     }
   }
 
-  @Test(expected = IllegalArgumentException.class)
+  @Test(expected = BlockPushNonFatalFailure.class)
   public void testPushBlockFromPreviousAttemptIsRejected()
       throws IOException, InterruptedException {
     Semaphore closed = new Semaphore(0);
@@ -998,11 +1000,12 @@ public class RemoteBlockPushResolverSuite {
     try {
       pushResolver.receiveBlockDataAsStream(
         new PushBlockStream(testApp, 1, 0, 0, 1, 0, 0));
-    } catch (IllegalArgumentException re) {
-      assertEquals(
-        "The attempt id 1 in this PushBlockStream message does not match " +
-          "with the current attempt id 2 stored in shuffle service for application " +
-          testApp, re.getMessage());
+    } catch (BlockPushNonFatalFailure re) {
+      BlockPushReturnCode errorCode =
+        (BlockPushReturnCode) BlockTransferMessage.Decoder.fromByteBuffer(re.getResponse());
+      assertEquals(BlockPushNonFatalFailure.ReturnCode.TOO_OLD_ATTEMPT_PUSH.id(),
+        errorCode.returnCode);
+      assertEquals(errorCode.failureBlockId, stream2.getID());
       throw re;
     }
   }
@@ -1034,7 +1037,7 @@ public class RemoteBlockPushResolverSuite {
     } catch (IllegalArgumentException e) {
       assertEquals(e.getMessage(),
         String.format("The attempt id %s in this FinalizeShuffleMerge message does not " +
-          "match with the current attempt id %s stored in shuffle service for application %s",
+            "match with the current attempt id %s stored in shuffle service for application %s",
           ATTEMPT_ID_1, ATTEMPT_ID_2, testApp));
       throw e;
     }
@@ -1158,8 +1161,8 @@ public class RemoteBlockPushResolverSuite {
 
     RemoteBlockPushResolver.AppShuffleInfo appShuffleInfo =
       pushResolver.validateAndGetAppShuffleInfo(TEST_APP);
-    assertTrue("Metadata of determinate shuffle should be removed after finalize shuffle"
-      + " merge", appShuffleInfo.getShuffles().get(0) == null);
+    assertTrue("Determinate shuffle should be marked finalized",
+        appShuffleInfo.getShuffles().get(0).isFinalized());
     validateMergeStatuses(statuses, new int[] {0}, new long[] {9});
     MergedBlockMeta blockMeta = pushResolver.getMergedBlockMeta(TEST_APP, 0, 0, 0);
     validateChunks(TEST_APP, 0, 0, 0, blockMeta, new int[]{4, 5}, new int[][]{{0}, {1}});
@@ -1244,7 +1247,7 @@ public class RemoteBlockPushResolverSuite {
     assertFalse("Meta files on the disk should be cleaned up",
       appShuffleInfo.getMergedShuffleMetaFile(0, 1, 0).exists());
     assertFalse("Index files on the disk should be cleaned up",
-      appShuffleInfo.getMergedShuffleIndexFile(0, 1, 0).exists());
+      new File(appShuffleInfo.getMergedShuffleIndexFilePath(0, 1, 0)).exists());
     stream2.onData(stream2.getID(), ByteBuffer.wrap(new byte[2]));
     stream2.onData(stream2.getID(), ByteBuffer.wrap(new byte[2]));
     // stream 2 now completes
@@ -1279,9 +1282,82 @@ public class RemoteBlockPushResolverSuite {
     assertFalse("MergedBlock meta file for shuffle 0 and shuffleMergeId 4 should be cleaned"
       + " up", appShuffleInfo.getMergedShuffleMetaFile(0, 4, 0).exists());
     assertFalse("MergedBlock index file for shuffle 0 and shuffleMergeId 4 should be cleaned"
-      + " up", appShuffleInfo.getMergedShuffleIndexFile(0, 4, 0).exists());
+      + " up", new File(appShuffleInfo.getMergedShuffleIndexFilePath(0, 4, 0)).exists());
     assertFalse("MergedBlock data file for shuffle 0 and shuffleMergeId 4 should be cleaned"
       + " up", appShuffleInfo.getMergedShuffleDataFile(0, 4, 0).exists());
+  }
+
+  @Test
+  public void testFinalizationResultIsEmptyWhenTheServerDidNotReceiveAnyBlocks() {
+    //shuffle 1 0 is finalized even though the server didn't receive any blocks for it.
+    MergeStatuses statuses = pushResolver.finalizeShuffleMerge(
+        new FinalizeShuffleMerge(TEST_APP, NO_ATTEMPT_ID, 1, 0));
+    assertEquals("no partitions were merged", 0, statuses.reduceIds.length);
+    RemoteBlockPushResolver.AppShuffleInfo appShuffleInfo =
+        pushResolver.validateAndGetAppShuffleInfo(TEST_APP);
+    assertTrue("shuffle 1 should be marked finalized",
+        appShuffleInfo.getShuffles().get(1).isFinalized());
+    removeApplication(TEST_APP);
+  }
+
+  // Test for SPARK-37675 and SPARK-37793
+  @Test
+  public void testEmptyMergePartitionsAreNotReported() throws IOException {
+    //shufflePush_1_0_0_100 is received by the server
+    StreamCallbackWithID stream1 = pushResolver.receiveBlockDataAsStream(
+        new PushBlockStream(TEST_APP, NO_ATTEMPT_ID, 1, 0, 0, 100, 0));
+    stream1.onData(stream1.getID(), ByteBuffer.wrap(new byte[4]));
+    //shuffle 1 0 is finalized
+    MergeStatuses statuses = pushResolver.finalizeShuffleMerge(
+        new FinalizeShuffleMerge(TEST_APP, NO_ATTEMPT_ID, 1, 0));
+    assertEquals("no partitions were merged", 0, statuses.reduceIds.length);
+    removeApplication(TEST_APP);
+  }
+
+  // Test for SPARK-37675 and SPARK-37793
+  @Test
+  public void testAllBlocksAreRejectedWhenReceivedAfterFinalization() throws IOException {
+    //shufflePush_1_0_0_100 is received by the server
+    StreamCallbackWithID stream1 = pushResolver.receiveBlockDataAsStream(
+        new PushBlockStream(TEST_APP, NO_ATTEMPT_ID, 1, 0, 0, 100, 0));
+    stream1.onData(stream1.getID(), ByteBuffer.wrap(new byte[4]));
+    stream1.onComplete(stream1.getID());
+    //shuffle 1 0 is finalized
+    pushResolver.finalizeShuffleMerge(new FinalizeShuffleMerge(TEST_APP, NO_ATTEMPT_ID, 1, 0));
+    BlockPushNonFatalFailure errorToValidate = null;
+    try {
+      //shufflePush_1_0_0_200 is received by the server after finalization of shuffle 1 0 which
+      //should be rejected
+      StreamCallbackWithID failureCallback = pushResolver.receiveBlockDataAsStream(
+          new PushBlockStream(TEST_APP, NO_ATTEMPT_ID, 1, 0, 0, 200, 0));
+      failureCallback.onComplete(failureCallback.getID());
+    } catch (BlockPushNonFatalFailure e) {
+      BlockPushReturnCode errorCode =
+          (BlockPushReturnCode) BlockTransferMessage.Decoder.fromByteBuffer(e.getResponse());
+      assertEquals(BlockPushNonFatalFailure.ReturnCode.TOO_LATE_BLOCK_PUSH.id(),
+          errorCode.returnCode);
+      errorToValidate = e;
+      assertEquals(errorCode.failureBlockId, "shufflePush_1_0_0_200");
+    }
+    assertNotNull("shufflePush_1_0_0_200 should be rejected", errorToValidate);
+    try {
+      //shufflePush_1_0_1_100 is received by the server after finalization of shuffle 1 0 which
+      //should also be rejected
+      StreamCallbackWithID failureCallback = pushResolver.receiveBlockDataAsStream(
+          new PushBlockStream(TEST_APP, NO_ATTEMPT_ID, 1, 0, 1, 100, 0));
+      failureCallback.onComplete(failureCallback.getID());
+    } catch (BlockPushNonFatalFailure e) {
+      BlockPushReturnCode errorCode =
+          (BlockPushReturnCode) BlockTransferMessage.Decoder.fromByteBuffer(e.getResponse());
+      assertEquals(BlockPushNonFatalFailure.ReturnCode.TOO_LATE_BLOCK_PUSH.id(),
+          errorCode.returnCode);
+      errorToValidate = e;
+      assertEquals(errorCode.failureBlockId, "shufflePush_1_0_1_100");
+    }
+    assertNotNull("shufflePush_1_0_1_100 should be rejected", errorToValidate);
+    MergedBlockMeta blockMeta = pushResolver.getMergedBlockMeta(TEST_APP, 1, 0, 100);
+    validateChunks(TEST_APP, 1, 0, 100, blockMeta, new int[]{4}, new int[][]{{0}});
+    removeApplication(TEST_APP);
   }
 
   private void useTestFiles(boolean useTestIndexFile, boolean useTestMetaFile) throws IOException {

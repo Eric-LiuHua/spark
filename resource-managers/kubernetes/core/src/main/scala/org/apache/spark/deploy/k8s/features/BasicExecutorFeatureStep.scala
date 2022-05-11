@@ -59,11 +59,16 @@ private[spark] class BasicExecutorFeatureStep(
   private val isDefaultProfile = resourceProfile.id == ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID
   private val isPythonApp = kubernetesConf.get(APP_RESOURCE_TYPE) == Some(APP_RESOURCE_TYPE_PYTHON)
   private val disableConfigMap = kubernetesConf.get(KUBERNETES_EXECUTOR_DISABLE_CONFIGMAP)
+  private val memoryOverheadFactor = if (kubernetesConf.contains(EXECUTOR_MEMORY_OVERHEAD_FACTOR)) {
+    kubernetesConf.get(EXECUTOR_MEMORY_OVERHEAD_FACTOR)
+  } else {
+    kubernetesConf.get(MEMORY_OVERHEAD_FACTOR)
+  }
 
   val execResources = ResourceProfile.getResourcesForClusterManager(
     resourceProfile.id,
     resourceProfile.executorResources,
-    kubernetesConf.get(MEMORY_OVERHEAD_FACTOR),
+    memoryOverheadFactor,
     kubernetesConf.sparkConf,
     isPythonApp,
     Map.empty)
@@ -136,6 +141,13 @@ private[spark] class BasicExecutorFeatureStep(
           .withName(ENV_EXECUTOR_POD_IP)
           .withValueFrom(new EnvVarSourceBuilder()
             .withNewFieldRef("v1", "status.podIP")
+            .build())
+          .build())
+      } ++ {
+        Seq(new EnvVarBuilder()
+          .withName(ENV_EXECUTOR_POD_NAME)
+          .withValueFrom(new EnvVarSourceBuilder()
+            .withNewFieldRef("v1", "metadata.name")
             .build())
           .build())
       } ++ {
@@ -260,16 +272,24 @@ private[spark] class BasicExecutorFeatureStep(
         .withUid(pod.getMetadata.getUid)
         .build()
     }
+
+    val policy = kubernetesConf.get(KUBERNETES_ALLOCATION_PODS_ALLOCATOR) match {
+      case "statefulset" => "Always"
+      case _ => "Never"
+    }
+    val annotations = kubernetesConf.annotations.map { case (k, v) =>
+      (k, Utils.substituteAppNExecIds(v, kubernetesConf.appId, kubernetesConf.executorId))
+    }
     val executorPodBuilder = new PodBuilder(pod.pod)
       .editOrNewMetadata()
         .withName(name)
         .addToLabels(kubernetesConf.labels.asJava)
-        .addToAnnotations(kubernetesConf.annotations.asJava)
+        .addToAnnotations(annotations.asJava)
         .addToOwnerReferences(ownerReference.toSeq: _*)
         .endMetadata()
       .editOrNewSpec()
         .withHostname(hostname)
-        .withRestartPolicy("Never")
+        .withRestartPolicy(policy)
         .addToNodeSelector(kubernetesConf.nodeSelector.asJava)
         .addToNodeSelector(kubernetesConf.executorNodeSelector.asJava)
         .addToImagePullSecrets(kubernetesConf.imagePullSecrets: _*)
@@ -287,7 +307,7 @@ private[spark] class BasicExecutorFeatureStep(
         .endSpec()
       .build()
     }
-    kubernetesConf.get(KUBERNETES_EXECUTOR_SCHEDULER_NAME)
+    kubernetesConf.schedulerName
       .foreach(executorPod.getSpec.setSchedulerName)
 
     SparkPod(executorPod, containerWithLifecycle)

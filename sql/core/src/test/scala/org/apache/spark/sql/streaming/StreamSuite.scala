@@ -216,7 +216,7 @@ class StreamSuite extends StreamTest {
             query.processAllAvailable()
             // Parquet write page-level CRC checksums will change the file size and
             // affect the data order when reading these files. Please see PARQUET-1746 for details.
-            val outputDf = spark.read.parquet(outputDir.getAbsolutePath).sort('a).as[Long]
+            val outputDf = spark.read.parquet(outputDir.getAbsolutePath).sort(Symbol("a")).as[Long]
             checkDataset[Long](outputDf, (0L to 10L).toArray: _*)
           } finally {
             query.stop()
@@ -310,7 +310,7 @@ class StreamSuite extends StreamTest {
     // For each batch, we would log the state change during the execution
     // This checks whether the key of the state change log is the expected batch id
     def CheckIncrementalExecutionCurrentBatchId(expectedId: Int): AssertOnQuery =
-      AssertOnQuery(_.lastExecution.asInstanceOf[IncrementalExecution].currentBatchId == expectedId,
+      AssertOnQuery(_.lastExecution.currentBatchId == expectedId,
         s"lastExecution's currentBatchId should be $expectedId")
 
     // For each batch, we would log the sink change after the execution

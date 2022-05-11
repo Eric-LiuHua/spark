@@ -20,6 +20,7 @@ package org.apache.spark.sql.catalyst.expressions
 import org.apache.spark.sql.catalyst.analysis.MultiAlias
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Project}
+import org.apache.spark.sql.types.Metadata
 
 /**
  * Helper methods for collecting and replacing aliases.
@@ -69,11 +70,17 @@ trait AliasHelper {
   protected def replaceAliasButKeepName(
      expr: NamedExpression,
      aliasMap: AttributeMap[Alias]): NamedExpression = {
-    // Use transformUp to prevent infinite recursion when the replacement expression
-    // redefines the same ExprId,
-    trimNonTopLevelAliases(expr.transformUp {
+    expr match {
+      // We need to keep the `Alias` if we replace a top-level Attribute, so that it's still a
+      // `NamedExpression`. We also need to keep the name of the original Attribute.
       case a: Attribute => aliasMap.get(a).map(_.withName(a.name)).getOrElse(a)
-    }).asInstanceOf[NamedExpression]
+      case o =>
+        // Use transformUp to prevent infinite recursion when the replacement expression
+        // redefines the same ExprId.
+        o.mapChildren(_.transformUp {
+          case a: Attribute => aliasMap.get(a).map(_.child).getOrElse(a)
+        }).asInstanceOf[NamedExpression]
+    }
   }
 
   protected def trimAliases(e: Expression): Expression = {
@@ -86,10 +93,15 @@ trait AliasHelper {
   protected def trimNonTopLevelAliases[T <: Expression](e: T): T = {
     val res = e match {
       case a: Alias =>
+        val metadata = if (a.metadata == Metadata.empty) {
+          None
+        } else {
+          Some(a.metadata)
+        }
         a.copy(child = trimAliases(a.child))(
           exprId = a.exprId,
           qualifier = a.qualifier,
-          explicitMetadata = Some(a.metadata),
+          explicitMetadata = metadata,
           nonInheritableMetadataKeys = a.nonInheritableMetadataKeys)
       case a: MultiAlias =>
         a.copy(child = trimAliases(a.child))

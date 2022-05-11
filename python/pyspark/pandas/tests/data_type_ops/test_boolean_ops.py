@@ -24,15 +24,15 @@ import numpy as np
 from pandas.api.types import CategoricalDtype
 
 from pyspark import pandas as ps
-from pyspark.pandas.tests.data_type_ops.testing_utils import TestCasesUtils
+from pyspark.pandas import option_context
+from pyspark.pandas.tests.data_type_ops.testing_utils import OpsTestBase
 from pyspark.pandas.typedef.typehints import (
     extension_float_dtypes_available,
     extension_object_dtypes_available,
 )
-from pyspark.testing.pandasutils import PandasOnSparkTestCase
 
 
-class BooleanOpsTest(PandasOnSparkTestCase, TestCasesUtils):
+class BooleanOpsTest(OpsTestBase):
     @property
     def bool_pdf(self):
         return pd.DataFrame({"this": [True, False, True], "that": [False, True, True]})
@@ -214,12 +214,8 @@ class BooleanOpsTest(PandasOnSparkTestCase, TestCasesUtils):
         pdf, psdf = self.pdf, self.psdf
 
         b_pser, b_psser = pdf["bool"], psdf["bool"]
-        if LooseVersion(pd.__version__) >= LooseVersion("0.25.3"):
-            self.assert_eq(1 // b_pser, 1 // b_psser)
-            self.assert_eq(0.1 // b_pser, 0.1 // b_psser)
-        else:
-            self.assert_eq(1 // b_psser, pd.Series([1.0, 1.0, np.inf], name="bool"))
-            self.assert_eq(0.1 // b_psser, pd.Series([0.0, 0.0, np.inf], name="bool"))
+        self.assert_eq(1 // b_pser, 1 // b_psser)
+        self.assert_eq(0.1 // b_pser, 0.1 // b_psser)
         self.assertRaises(TypeError, lambda: "x" // b_psser)
         self.assertRaises(TypeError, lambda: True // b_psser)
         self.assertRaises(TypeError, lambda: datetime.date(1994, 1, 1) // b_psser)
@@ -238,9 +234,9 @@ class BooleanOpsTest(PandasOnSparkTestCase, TestCasesUtils):
         self.assertRaises(TypeError, lambda: datetime.datetime(1994, 1, 1) ** b_psser)
 
     def test_rmod(self):
-        pdf, psdf = self.pdf, self.psdf
+        psdf = self.psdf
 
-        b_pser, b_psser = pdf["bool"], psdf["bool"]
+        b_psser = psdf["bool"]
         # 1 % False is 0.0 in pandas
         self.assert_eq(pd.Series([0, 0, None], dtype=float, name="bool"), 1 % b_psser)
         # 0.1 / True is 0.1 in pandas
@@ -285,6 +281,32 @@ class BooleanOpsTest(PandasOnSparkTestCase, TestCasesUtils):
         pser, psser = self.pdf["bool"], self.psdf["bool"]
         self.assert_eq(True | pser, True | psser)
         self.assert_eq(False | pser, False | psser)
+
+    def test_xor(self):
+        pdf, psdf = self.bool_pdf, self.bool_psdf
+        pser, other_pser = pdf["this"], pdf["that"]
+        psser, other_psser = psdf["this"], psdf["that"]
+
+        self.assert_eq(pser ^ other_pser, psser ^ other_psser)
+        self.assert_eq(pser ^ True, psser ^ True)
+        self.assert_eq(pser ^ False, psser ^ False)
+        self.assert_eq(pser ^ 2, psser ^ 2)
+        self.assert_eq(pser ^ 99, psser ^ 99)
+
+        with self.assertRaisesRegex(TypeError, "XOR can not be applied to given types."):
+            psser ^ "a"
+
+        with option_context("compute.ops_on_diff_frames", True):
+            pser, other_pser = self.pdf["bool"], self.integral_pdf["this"]
+            psser, other_psser = self.psdf["bool"], self.integral_psdf["this"]
+
+            self.assert_eq(pser ^ other_pser, psser ^ other_psser)
+
+    def test_rxor(self):
+        pser, psser = self.pdf["bool"], self.psdf["bool"]
+        self.assert_eq(True ^ pser, True ^ psser)
+        self.assert_eq(False ^ pser, False ^ psser)
+        self.assert_eq(1 ^ pser, 1 ^ psser)
 
     def test_isnull(self):
         self.assert_eq(self.pdf["bool"].isnull(), self.psdf["bool"].isnull())
@@ -358,7 +380,7 @@ class BooleanOpsTest(PandasOnSparkTestCase, TestCasesUtils):
 @unittest.skipIf(
     not extension_object_dtypes_available, "pandas extension object dtypes are not available"
 )
-class BooleanExtensionOpsTest(PandasOnSparkTestCase, TestCasesUtils):
+class BooleanExtensionOpsTest(OpsTestBase):
     @property
     def boolean_pdf(self):
         return pd.DataFrame(
@@ -685,6 +707,26 @@ class BooleanExtensionOpsTest(PandasOnSparkTestCase, TestCasesUtils):
         pser, psser = self.boolean_pdf["this"], self.boolean_psdf["this"]
         self.check_extension(True | pser, True | psser)
         self.check_extension(False | pser, False | psser)
+
+    def test_xor(self):
+        pdf, psdf = self.boolean_pdf, self.boolean_psdf
+        pser, psser = pdf["this"], psdf["this"]
+        other_pser, other_psser = pdf["that"], psdf["that"]
+        self.check_extension(pser ^ True, psser ^ True)
+        self.check_extension(pser ^ False, psser ^ False)
+        self.check_extension(pser ^ pser, psser ^ psser)
+
+        self.check_extension(pser ^ other_pser, psser ^ other_psser)
+        self.check_extension(other_pser ^ pser, other_psser ^ psser)
+        with self.assertRaisesRegex(TypeError, "XOR can not be applied to given types."):
+            psser ^ 2
+
+    def test_rxor(self):
+        pser, psser = self.boolean_pdf["this"], self.boolean_psdf["this"]
+        self.check_extension(True | pser, True | psser)
+        self.check_extension(False | pser, False | psser)
+        with self.assertRaisesRegex(TypeError, "XOR can not be applied to given types."):
+            1 ^ psser
 
     def test_from_to_pandas(self):
         data = [True, True, False, None]

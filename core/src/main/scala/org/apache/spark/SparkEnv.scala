@@ -26,12 +26,13 @@ import scala.collection.concurrent
 import scala.collection.mutable
 import scala.util.Properties
 
-import com.github.benmanes.caffeine.cache.Caffeine
+import com.google.common.cache.CacheBuilder
 import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.api.python.PythonWorkerFactory
 import org.apache.spark.broadcast.BroadcastManager
+import org.apache.spark.executor.ExecutorBackend
 import org.apache.spark.internal.{config, Logging}
 import org.apache.spark.internal.config._
 import org.apache.spark.memory.{MemoryManager, UnifiedMemoryManager}
@@ -77,9 +78,11 @@ class SparkEnv (
   // A general, soft-reference map for metadata needed during HadoopRDD split computation
   // (e.g., HadoopFileRDD uses this to cache JobConfs and InputFormats).
   private[spark] val hadoopJobMetadata =
-    Caffeine.newBuilder().softValues().build[String, AnyRef]().asMap()
+    CacheBuilder.newBuilder().softValues().build[String, AnyRef]().asMap()
 
   private[spark] var driverTmpDir: Option[String] = None
+
+  private[spark] var executorBackend: Option[ExecutorBackend] = None
 
   private[spark] def stop(): Unit = {
 
@@ -272,33 +275,7 @@ object SparkEnv extends Logging {
       conf.set(DRIVER_PORT, rpcEnv.address.port)
     }
 
-    // Create an instance of the class with the given name, possibly initializing it with our conf
-    def instantiateClass[T](className: String): T = {
-      val cls = Utils.classForName(className)
-      // Look for a constructor taking a SparkConf and a boolean isDriver, then one taking just
-      // SparkConf, then one taking no arguments
-      try {
-        cls.getConstructor(classOf[SparkConf], java.lang.Boolean.TYPE)
-          .newInstance(conf, java.lang.Boolean.valueOf(isDriver))
-          .asInstanceOf[T]
-      } catch {
-        case _: NoSuchMethodException =>
-          try {
-            cls.getConstructor(classOf[SparkConf]).newInstance(conf).asInstanceOf[T]
-          } catch {
-            case _: NoSuchMethodException =>
-              cls.getConstructor().newInstance().asInstanceOf[T]
-          }
-      }
-    }
-
-    // Create an instance of the class named by the given SparkConf property
-    // if the property is not set, possibly initializing it with our conf
-    def instantiateClassFromConf[T](propertyName: ConfigEntry[String]): T = {
-      instantiateClass[T](conf.get(propertyName))
-    }
-
-    val serializer = instantiateClassFromConf[Serializer](SERIALIZER)
+    val serializer = Utils.instantiateSerializerFromConf[Serializer](SERIALIZER, conf, isDriver)
     logDebug(s"Using serializer: ${serializer.getClass}")
 
     val serializerManager = new SerializerManager(serializer, conf, ioEncryptionKey)
@@ -337,7 +314,8 @@ object SparkEnv extends Logging {
     val shuffleMgrName = conf.get(config.SHUFFLE_MANAGER)
     val shuffleMgrClass =
       shortShuffleMgrNames.getOrElse(shuffleMgrName.toLowerCase(Locale.ROOT), shuffleMgrName)
-    val shuffleManager = instantiateClass[ShuffleManager](shuffleMgrClass)
+    val shuffleManager = Utils.instantiateSerializerOrShuffleManager[ShuffleManager](
+      shuffleMgrClass, conf, isDriver)
 
     val memoryManager: MemoryManager = UnifiedMemoryManager(conf, numUsableCores)
 
@@ -365,12 +343,14 @@ object SparkEnv extends Logging {
           isLocal,
           conf,
           listenerBus,
-          if (conf.get(config.SHUFFLE_SERVICE_FETCH_RDD_ENABLED)) {
+          if (conf.get(config.SHUFFLE_SERVICE_ENABLED)) {
             externalShuffleClient
           } else {
             None
           }, blockManagerInfo,
-          mapOutputTracker.asInstanceOf[MapOutputTrackerMaster])),
+          mapOutputTracker.asInstanceOf[MapOutputTrackerMaster],
+          shuffleManager,
+          isDriver)),
       registerOrLookupEndpoint(
         BlockManagerMaster.DRIVER_HEARTBEAT_ENDPOINT_NAME,
         new BlockManagerMasterHeartbeatEndpoint(rpcEnv, isLocal, blockManagerInfo)),

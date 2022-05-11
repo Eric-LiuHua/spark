@@ -112,9 +112,11 @@ class StringFunctionsSuite extends QueryTest with SharedSparkSession {
     val df = Seq[(String, String, String, Int)](("hello", "world", null, 15))
       .toDF("a", "b", "c", "d")
 
-    checkAnswer(
-      df.selectExpr("elt(0, a, b, c)", "elt(1, a, b, c)", "elt(4, a, b, c)"),
-      Row(null, "hello", null))
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
+      checkAnswer(
+        df.selectExpr("elt(0, a, b, c)", "elt(1, a, b, c)", "elt(4, a, b, c)"),
+        Row(null, "hello", null))
+    }
 
     // check implicit type cast
     checkAnswer(
@@ -383,9 +385,11 @@ class StringFunctionsSuite extends QueryTest with SharedSparkSession {
       Row("host", "/file;param", "query;p2", null, "http", "/file;param?query;p2",
         "user:pass@host", "user:pass", null))
 
-    testUrl(
-      "inva lid://user:pass@host/file;param?query;p2",
-      Row(null, null, null, null, null, null, null, null, null))
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
+      testUrl(
+        "inva lid://user:pass@host/file;param?query;p2",
+        Row(null, null, null, null, null, null, null, null, null))
+    }
 
   }
 
@@ -484,6 +488,58 @@ class StringFunctionsSuite extends QueryTest with SharedSparkSession {
       df.selectExpr("length(c)", "length(d)", "length(e)"),
       Row(3, 3, 5)
     )
+  }
+
+  test("SPARK-36751: add octet length api for scala") {
+    // scalastyle:off
+    // non ascii characters are not allowed in the code, so we disable the scalastyle here.
+    val df = Seq(("123", Array[Byte](1, 2, 3, 4), 123, 2.0f, 3.015, "\ud83d\udc08"))
+      .toDF("a", "b", "c", "d", "e", "f")
+    // string and binary input
+    checkAnswer(
+      df.select(octet_length($"a"), octet_length($"b")),
+      Row(3, 4))
+    // string and binary input
+    checkAnswer(
+      df.selectExpr("octet_length(a)", "octet_length(b)"),
+      Row(3, 4))
+    // integer, float and double input
+    checkAnswer(
+      df.selectExpr("octet_length(c)", "octet_length(d)", "octet_length(e)"),
+      Row(3, 3, 5)
+    )
+    // multi-byte character input
+    checkAnswer(
+      df.selectExpr("octet_length(f)"),
+      Row(4)
+    )
+    // scalastyle:on
+  }
+
+  test("SPARK-36751: add bit length api for scala") {
+    // scalastyle:off
+    // non ascii characters are not allowed in the code, so we disable the scalastyle here.
+    val df = Seq(("123", Array[Byte](1, 2, 3, 4), 123, 2.0f, 3.015, "\ud83d\udc08"))
+      .toDF("a", "b", "c", "d", "e", "f")
+    // string and binary input
+    checkAnswer(
+      df.select(bit_length($"a"), bit_length($"b")),
+      Row(24, 32))
+    // string and binary input
+    checkAnswer(
+      df.selectExpr("bit_length(a)", "bit_length(b)"),
+      Row(24, 32))
+    // integer, float and double input
+    checkAnswer(
+      df.selectExpr("bit_length(c)", "bit_length(d)", "bit_length(e)"),
+      Row(24, 24, 40)
+    )
+    // multi-byte character input
+    checkAnswer(
+      df.selectExpr("bit_length(f)"),
+      Row(32)
+    )
+    // scalastyle:on
   }
 
   test("initcap function") {

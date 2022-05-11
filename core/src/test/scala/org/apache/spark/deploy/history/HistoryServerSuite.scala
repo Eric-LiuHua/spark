@@ -86,12 +86,15 @@ class HistoryServerSuite extends SparkFunSuite with BeforeAndAfter with Matchers
       .set(EVENT_LOG_STAGE_EXECUTOR_METRICS, true)
       .set(EXECUTOR_PROCESS_TREE_METRICS_ENABLED, true)
     conf.setAll(extraConf)
+    // Since LevelDB doesn't support Apple Silicon yet, fallback to in-memory provider
+    if (Utils.isMacOnAppleSilicon) {
+      conf.remove(LOCAL_STORE_DIR)
+    }
     provider = new FsHistoryProvider(conf)
     provider.checkForLogs()
     val securityManager = HistoryServer.createSecurityManager(conf)
 
     server = new HistoryServer(conf, provider, securityManager, 18080)
-    server.initialize()
     server.bind()
     provider.start()
     port = server.boundPort
@@ -143,6 +146,7 @@ class HistoryServerSuite extends SparkFunSuite with BeforeAndAfter with Matchers
     "one stage attempt json" -> "applications/local-1422981780767/stages/1/0",
     "one stage attempt json details with failed task" ->
       "applications/local-1422981780767/stages/1/0?details=true&taskStatus=failed",
+    "one stage json with partitionId" -> "applications/local-1642039451826/stages/2",
 
     "stage task summary w shuffle write"
       -> "applications/local-1430917381534/stages/0/0/taskSummary",
@@ -166,6 +170,7 @@ class HistoryServerSuite extends SparkFunSuite with BeforeAndAfter with Matchers
       "applications/local-1430917381534/stages/0/0/taskList?status=success&offset=1&length=2",
     "stage task list w/ status & sortBy short names: runtime" ->
       "applications/local-1430917381534/stages/0/0/taskList?status=success&sortBy=runtime",
+    "stage task list with partitionId" -> "applications/local-1642039451826/stages/0/0/taskList",
 
     "stage list with accumulable json" -> "applications/local-1426533911241/1/stages",
     "stage with accumulable json" -> "applications/local-1426533911241/1/stages/0/0",
@@ -192,7 +197,10 @@ class HistoryServerSuite extends SparkFunSuite with BeforeAndAfter with Matchers
     // Enable "spark.eventLog.logBlockUpdates.enabled", to get the storage information
     // in the history server.
     "one rdd storage json" -> "applications/local-1422981780767/storage/rdd/0",
-    "miscellaneous process" -> "applications/application_1555004656427_0144/allmiscellaneousprocess"
+    "miscellaneous process" ->
+      "applications/application_1555004656427_0144/allmiscellaneousprocess",
+    "stage with speculation summary" ->
+      "applications/application_1628109047826_1317105/stages/0/0/"
   )
 
   // run a bunch of characterization tests -- just verify the behavior is the same as what is saved
@@ -385,6 +393,10 @@ class HistoryServerSuite extends SparkFunSuite with BeforeAndAfter with Matchers
       .set(EVENT_LOG_ENABLED, true)
       .set(LOCAL_STORE_DIR, storeDir.getAbsolutePath())
       .remove(IS_TESTING)
+    // Since LevelDB doesn't support Apple Silicon yet, fallback to in-memory provider
+    if (Utils.isMacOnAppleSilicon) {
+      myConf.remove(LOCAL_STORE_DIR)
+    }
     val provider = new FsHistoryProvider(myConf)
     val securityManager = HistoryServer.createSecurityManager(myConf)
 
@@ -410,7 +422,6 @@ class HistoryServerSuite extends SparkFunSuite with BeforeAndAfter with Matchers
     }
 
     server = new HistoryServer(myConf, provider, securityManager, 0)
-    server.initialize()
     server.bind()
     provider.start()
     val port = server.boundPort

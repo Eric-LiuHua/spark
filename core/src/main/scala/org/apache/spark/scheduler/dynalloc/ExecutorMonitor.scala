@@ -24,6 +24,7 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable
 
 import org.apache.spark._
+import org.apache.spark.errors.SparkCoreErrors
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.resource.ResourceProfile.UNKNOWN_RESOURCE_PROFILE_ID
@@ -133,7 +134,7 @@ private[spark] class ExecutorMonitor(
         .toSeq
       updateNextTimeout(newNextTimeout)
     }
-    timedOutExecs
+    timedOutExecs.sortBy(_._1)
   }
 
   /**
@@ -355,7 +356,8 @@ private[spark] class ExecutorMonitor(
     if (removed != null) {
       decrementExecResourceProfileCount(removed.resourceProfileId)
       if (removed.decommissioning) {
-        if (event.reason == ExecutorLossMessage.decommissionFinished) {
+        if (event.reason == ExecutorLossMessage.decommissionFinished ||
+            event.reason == ExecutorDecommission().message) {
           metrics.gracefullyDecommissioned.inc()
         } else {
           metrics.decommissionUnfinished.inc()
@@ -377,6 +379,10 @@ private[spark] class ExecutorMonitor(
   }
 
   override def onBlockUpdated(event: SparkListenerBlockUpdated): Unit = {
+    if (!client.isExecutorActive(event.blockUpdatedInfo.blockManagerId.executorId)) {
+      return
+    }
+
     val exec = ensureExecutorIsTracked(event.blockUpdatedInfo.blockManagerId.executorId,
       UNKNOWN_RESOURCE_PROFILE_ID)
 
@@ -460,7 +466,7 @@ private[spark] class ExecutorMonitor(
 
   // Visible for testing.
   private[dynalloc] def isExecutorIdle(id: String): Boolean = {
-    Option(executors.get(id)).map(_.isIdle).getOrElse(throw new NoSuchElementException(id))
+    Option(executors.get(id)).map(_.isIdle).getOrElse(throw SparkCoreErrors.noExecutorIdleError(id))
   }
 
   // Visible for testing

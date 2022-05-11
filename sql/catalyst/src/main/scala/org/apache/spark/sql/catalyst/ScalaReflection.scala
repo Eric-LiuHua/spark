@@ -31,6 +31,7 @@ import org.apache.spark.sql.catalyst.util.{ArrayData, MapData}
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
+import org.apache.spark.util.Utils
 
 
 /**
@@ -102,7 +103,7 @@ object ScalaReflection extends ScalaReflection {
         val className = getClassNameFromType(tpe)
         className match {
           case "scala.Array" =>
-            val TypeRef(_, _, Seq(elementType)) = tpe
+            val TypeRef(_, _, Seq(elementType)) = tpe.dealias
             arrayClassFor(elementType)
           case other =>
             val clazz = getClassFromType(tpe)
@@ -752,7 +753,8 @@ object ScalaReflection extends ScalaReflection {
         Schema(TimestampType, nullable = true)
       case t if isSubtype(t, localTypeOf[java.sql.Timestamp]) =>
         Schema(TimestampType, nullable = true)
-      case t if isSubtype(t, localTypeOf[java.time.LocalDateTime]) =>
+      // SPARK-38813: Remove TimestampNTZ type support in Spark 3.3 with minimal code changes.
+      case t if isSubtype(t, localTypeOf[java.time.LocalDateTime]) && Utils.isTesting =>
         Schema(TimestampNTZType, nullable = true)
       case t if isSubtype(t, localTypeOf[java.time.LocalDate]) => Schema(DateType, nullable = true)
       case t if isSubtype(t, localTypeOf[java.sql.Date]) => Schema(DateType, nullable = true)
@@ -809,7 +811,7 @@ object ScalaReflection extends ScalaReflection {
    */
   def findConstructor[T](cls: Class[T], paramTypes: Seq[Class[_]]): Option[Seq[AnyRef] => T] = {
     Option(ConstructorUtils.getMatchingAccessibleConstructor(cls, paramTypes: _*)) match {
-      case Some(c) => Some(x => c.newInstance(x: _*).asInstanceOf[T])
+      case Some(c) => Some(x => c.newInstance(x: _*))
       case None =>
         val companion = mirror.staticClass(cls.getName).companion
         val moduleMirror = mirror.reflectModule(companion.asModule)
@@ -858,7 +860,9 @@ object ScalaReflection extends ScalaReflection {
     StringType -> classOf[UTF8String],
     DateType -> classOf[DateType.InternalType],
     TimestampType -> classOf[TimestampType.InternalType],
-    TimestampNTZType -> classOf[TimestampNTZType.InternalType],
+    // SPARK-38813: Remove TimestampNTZ type support in Spark 3.3 with minimal code changes.
+    TimestampNTZType ->
+      (if (Utils.isTesting) classOf[TimestampNTZType.InternalType] else classOf[java.lang.Object]),
     BinaryType -> classOf[BinaryType.InternalType],
     CalendarIntervalType -> classOf[CalendarInterval]
   )
@@ -873,7 +877,9 @@ object ScalaReflection extends ScalaReflection {
     DoubleType -> classOf[java.lang.Double],
     DateType -> classOf[java.lang.Integer],
     TimestampType -> classOf[java.lang.Long],
-    TimestampNTZType -> classOf[java.lang.Long]
+    // SPARK-38813: Remove TimestampNTZ type support in Spark 3.3 with minimal code changes.
+    TimestampNTZType ->
+      (if (Utils.isTesting) classOf[java.lang.Long] else classOf[java.lang.Object])
   )
 
   def dataTypeJavaClass(dt: DataType): Class[_] = {
@@ -889,6 +895,7 @@ object ScalaReflection extends ScalaReflection {
     }
   }
 
+  @scala.annotation.tailrec
   def javaBoxedType(dt: DataType): Class[_] = dt match {
     case _: DecimalType => classOf[Decimal]
     case _: DayTimeIntervalType => classOf[java.lang.Long]

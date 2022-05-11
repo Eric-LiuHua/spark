@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.types
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkException, SparkFunSuite}
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.analysis.{caseInsensitiveResolution, caseSensitiveResolution}
 import org.apache.spark.sql.catalyst.parser.ParseException
@@ -25,7 +25,9 @@ import org.apache.spark.sql.catalyst.plans.SQLHelper
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{DayTimeIntervalType => DT}
 import org.apache.spark.sql.types.{YearMonthIntervalType => YM}
+import org.apache.spark.sql.types.DayTimeIntervalType._
 import org.apache.spark.sql.types.StructType.fromDDL
+import org.apache.spark.sql.types.YearMonthIntervalType._
 
 class StructTypeSuite extends SparkFunSuite with SQLHelper {
 
@@ -49,7 +51,7 @@ class StructTypeSuite extends SparkFunSuite with SQLHelper {
   test("SPARK-24849: toDDL - simple struct") {
     val struct = StructType(Seq(StructField("a", IntegerType)))
 
-    assert(struct.toDDL == "`a` INT")
+    assert(struct.toDDL == "a INT")
   }
 
   test("SPARK-24849: round trip toDDL - fromDDL") {
@@ -59,7 +61,7 @@ class StructTypeSuite extends SparkFunSuite with SQLHelper {
   }
 
   test("SPARK-24849: round trip fromDDL - toDDL") {
-    val struct = "`a` MAP<INT, STRING>,`b` INT"
+    val struct = "a MAP<INT, STRING>,b INT"
 
     assert(fromDDL(struct).toDDL === struct)
   }
@@ -68,14 +70,14 @@ class StructTypeSuite extends SparkFunSuite with SQLHelper {
     val struct = new StructType()
       .add("metaData", new StructType().add("eventId", StringType))
 
-    assert(struct.toDDL == "`metaData` STRUCT<`eventId`: STRING>")
+    assert(struct.toDDL == "metaData STRUCT<eventId: STRING>")
   }
 
   test("SPARK-24849: toDDL should output field's comment") {
     val struct = StructType(Seq(
       StructField("b", BooleanType).withComment("Field's comment")))
 
-    assert(struct.toDDL == """`b` BOOLEAN COMMENT 'Field\'s comment'""")
+    assert(struct.toDDL == """b BOOLEAN COMMENT 'Field\'s comment'""")
   }
 
   private val nestedStruct = new StructType()
@@ -87,7 +89,7 @@ class StructTypeSuite extends SparkFunSuite with SQLHelper {
     ).withComment("comment"))
 
   test("SPARK-33846: toDDL should output nested field's comment") {
-    val ddl = "`a` STRUCT<`b`: STRUCT<`c`: STRING COMMENT 'Deep Nested comment'> " +
+    val ddl = "a STRUCT<b: STRUCT<c: STRING COMMENT 'Deep Nested comment'> " +
       "COMMENT 'Nested comment'> COMMENT 'comment'"
     assert(nestedStruct.toDDL == ddl)
   }
@@ -151,7 +153,7 @@ class StructTypeSuite extends SparkFunSuite with SQLHelper {
   }
 
   test("interval keyword in schema string") {
-    val interval = "`a` INTERVAL"
+    val interval = "a INTERVAL"
     assert(fromDDL(interval).toDDL === interval)
   }
 
@@ -248,10 +250,10 @@ class StructTypeSuite extends SparkFunSuite with SQLHelper {
   }
 
   test("SPARK-35285: ANSI interval types in schema") {
-    val yearMonthInterval = "`ymi` INTERVAL YEAR TO MONTH"
+    val yearMonthInterval = "ymi INTERVAL YEAR TO MONTH"
     assert(fromDDL(yearMonthInterval).toDDL === yearMonthInterval)
 
-    val dayTimeInterval = "`dti` INTERVAL DAY TO SECOND"
+    val dayTimeInterval = "dti INTERVAL DAY TO SECOND"
     assert(fromDDL(dayTimeInterval).toDDL === dayTimeInterval)
   }
 
@@ -381,5 +383,57 @@ class StructTypeSuite extends SparkFunSuite with SQLHelper {
     }
     assert(e.getMessage.contains(
       "Field name a2.element.C.name is invalid: a2.element.c is not a struct"))
+  }
+
+  test("SPARK-36807: Merge ANSI interval types to a tightest common type") {
+    Seq(
+      (YM(YEAR), YM(YEAR)) -> YM(YEAR),
+      (YM(YEAR), YM(MONTH)) -> YM(YEAR, MONTH),
+      (YM(MONTH), YM(MONTH)) -> YM(MONTH),
+      (YM(YEAR, MONTH), YM(YEAR)) -> YM(YEAR, MONTH),
+      (YM(YEAR, MONTH), YM(YEAR, MONTH)) -> YM(YEAR, MONTH),
+      (DT(DAY), DT(DAY)) -> DT(DAY),
+      (DT(SECOND), DT(SECOND)) -> DT(SECOND),
+      (DT(DAY), DT(SECOND)) -> DT(DAY, SECOND),
+      (DT(HOUR, SECOND), DT(DAY, MINUTE)) -> DT(DAY, SECOND),
+      (DT(HOUR, MINUTE), DT(DAY, SECOND)) -> DT(DAY, SECOND)
+    ).foreach { case ((i1, i2), expected) =>
+      val st1 = new StructType().add("interval", i1)
+      val st2 = new StructType().add("interval", i2)
+      val expectedStruct = new StructType().add("interval", expected)
+      assert(st1.merge(st2) === expectedStruct)
+      assert(st2.merge(st1) === expectedStruct)
+    }
+  }
+
+  test("SPARK-37076: Implement StructType.toString explicitly for Scala 2.13") {
+    val struct = StructType(StructField("a", IntegerType) :: Nil)
+    assert(struct.toString() === "StructType(StructField(a,IntegerType,true))")
+  }
+
+  test("SPARK-37191: Merge DecimalType") {
+    val source1 = StructType.fromDDL("c1 DECIMAL(12, 2)")
+      .merge(StructType.fromDDL("c1 DECIMAL(12, 2)"))
+    assert(source1 === StructType.fromDDL("c1 DECIMAL(12, 2)"))
+
+    val source2 = StructType.fromDDL("c1 DECIMAL(12, 2)")
+      .merge(StructType.fromDDL("c1 DECIMAL(17, 2)"))
+    assert(source2 === StructType.fromDDL("c1 DECIMAL(17, 2)"))
+
+    val source3 = StructType.fromDDL("c1 DECIMAL(17, 2)")
+      .merge(StructType.fromDDL("c1 DECIMAL(12, 2)"))
+    assert(source3 === StructType.fromDDL("c1 DECIMAL(17, 2)"))
+
+    // Invalid merge cases:
+
+    var e = intercept[SparkException] {
+      StructType.fromDDL("c1 DECIMAL(10, 5)").merge(StructType.fromDDL("c1 DECIMAL(12, 2)"))
+    }
+    assert(e.getMessage.contains("Failed to merge decimal types"))
+
+    e = intercept[SparkException] {
+      StructType.fromDDL("c1 DECIMAL(12, 5)").merge(StructType.fromDDL("c1 DECIMAL(12, 2)"))
+    }
+    assert(e.getMessage.contains("Failed to merge decimal types"))
   }
 }

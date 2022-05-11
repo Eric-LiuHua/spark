@@ -29,6 +29,7 @@ import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.{Cross, LeftOuter, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, GenericArrayData, MapData}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
 private[sql] case class GroupableData(data: Int) {
@@ -107,6 +108,16 @@ class AnalysisErrorSuite extends AnalysisTest {
       caseSensitive: Boolean = true): Unit = {
     test(name) {
       assertAnalysisError(plan, errorMessages, caseSensitive)
+    }
+  }
+
+  def errorClassTest(
+      name: String,
+      plan: LogicalPlan,
+      errorClass: String,
+      messageParameters: Array[String]): Unit = {
+    test(name) {
+      assertAnalysisErrorClass(plan, errorClass, messageParameters)
     }
   }
 
@@ -207,7 +218,7 @@ class AnalysisErrorSuite extends AnalysisTest {
     "higher order function with filter predicate",
     CatalystSqlParser.parsePlan("SELECT aggregate(array(1, 2, 3), 0, (acc, x) -> acc + x) " +
       "FILTER (WHERE c > 1)"),
-    "FILTER predicate specified, but aggregate is not an aggregate function" :: Nil)
+    "Function aggregate does not support FILTER clause" :: Nil)
 
   errorTest(
     "non-deterministic filter predicate in aggregate functions",
@@ -282,17 +293,19 @@ class AnalysisErrorSuite extends AnalysisTest {
     listRelation.select(Explode($"list").as("a"), Explode($"list").as("b")),
     "only one generator" :: "explode" :: Nil)
 
-  errorTest(
+  errorClassTest(
     "unresolved attributes",
     testRelation.select($"abcd"),
-    "cannot resolve" :: "abcd" :: Nil)
+    "MISSING_COLUMN",
+    Array("abcd", "a"))
 
-  errorTest(
+  errorClassTest(
     "unresolved attributes with a generated name",
     testRelation2.groupBy($"a")(max($"b"))
       .where(sum($"b") > 0)
       .orderBy($"havingCondition".asc),
-    "cannot resolve" :: "havingCondition" :: Nil)
+    "MISSING_COLUMN",
+    Array("havingCondition", "max(b)"))
 
   errorTest(
     "unresolved star expansion in max",
@@ -304,10 +317,11 @@ class AnalysisErrorSuite extends AnalysisTest {
     mapRelation.orderBy($"map".asc),
     "sort" :: "type" :: "map<int,int>" :: Nil)
 
-  errorTest(
+  errorClassTest(
     "sorting by attributes are not from grouping expressions",
     testRelation2.groupBy($"a", $"c")($"a", $"c", count($"a").as("a3")).orderBy($"b".asc),
-    "cannot resolve" :: "'b'" :: "given input columns" :: "[a, a3, c]" :: Nil)
+    "MISSING_COLUMN",
+    Array("b", "a, c, a3"))
 
   errorTest(
     "non-boolean filters",
@@ -396,11 +410,12 @@ class AnalysisErrorSuite extends AnalysisTest {
     testRelation3.except(testRelation4, isAll = false),
     "except" :: "the compatible column types" :: "map" :: "decimal" :: Nil)
 
-  errorTest(
+  errorClassTest(
     "SPARK-9955: correct error message for aggregate",
     // When parse SQL string, we will wrap aggregate expressions with UnresolvedAlias.
     testRelation2.where($"bad_column" > 1).groupBy($"a")(UnresolvedAlias(max($"b"))),
-    "cannot resolve 'bad_column'" :: Nil)
+    "MISSING_COLUMN",
+    Array("bad_column", "a, b, c, d, e"))
 
   errorTest(
     "slide duration greater than window in time window",
@@ -529,6 +544,22 @@ class AnalysisErrorSuite extends AnalysisTest {
     "Only one generator allowed per select clause but found 2: " +
       "explode(array(min(a))), explode(array(max(a)))" :: Nil
   )
+
+  errorTest(
+    "SPARK-38666: non-boolean aggregate filter",
+    CatalystSqlParser.parsePlan("SELECT sum(c) filter (where e) FROM TaBlE2"),
+    "FILTER expression is not of type boolean" :: Nil)
+
+  errorTest(
+    "SPARK-38666: aggregate in aggregate filter",
+    CatalystSqlParser.parsePlan("SELECT sum(c) filter (where max(e) > 1) FROM TaBlE2"),
+    "FILTER expression contains aggregate" :: Nil)
+
+  errorTest(
+    "SPARK-38666: window function in aggregate filter",
+    CatalystSqlParser.parsePlan("SELECT sum(c) " +
+       "filter (where nth_value(e, 2) over(order by b) > 1) FROM TaBlE2"),
+    "FILTER expression contains window function" :: Nil)
 
   test("SPARK-6452 regression test") {
     // CheckAnalysis should throw AnalysisException when Aggregate contains missing attribute(s)
@@ -714,7 +745,7 @@ class AnalysisErrorSuite extends AnalysisTest {
 
   test("SPARK-30811: CTE should not cause stack overflow when " +
     "it refers to non-existent table with same name") {
-    val plan = With(
+    val plan = UnresolvedWith(
       UnresolvedRelation(TableIdentifier("t")),
       Seq("t" -> SubqueryAlias("t",
         Project(
@@ -769,15 +800,17 @@ class AnalysisErrorSuite extends AnalysisTest {
   }
 
   errorTest(
-    "SC-69611: error code to error message",
+    "SPARK-34920: error code to error message",
     testRelation2.where($"bad_column" > 1).groupBy($"a")(UnresolvedAlias(max($"b"))),
-    "cannot resolve 'bad_column' given input columns: [a, b, c, d, e]" :: Nil)
+    "Column 'bad_column' does not exist. Did you mean one of the following? [a, b, c, d, e]"
+      :: Nil)
 
   test("SPARK-35080: Unsupported correlated equality predicates in subquery") {
     val a = AttributeReference("a", IntegerType)()
     val b = AttributeReference("b", IntegerType)()
     val c = AttributeReference("c", IntegerType)()
-    val t1 = LocalRelation(a, b)
+    val d = AttributeReference("d", DoubleType)()
+    val t1 = LocalRelation(a, b, d)
     val t2 = LocalRelation(c)
     val conditions = Seq(
       (abs($"a") === $"c", "abs(a) = outer(c)"),
@@ -785,7 +818,7 @@ class AnalysisErrorSuite extends AnalysisTest {
       ($"a" + 1 === $"c", "(a + 1) = outer(c)"),
       ($"a" + $"b" === $"c", "(a + b) = outer(c)"),
       ($"a" + $"c" === $"b", "(a + outer(c)) = b"),
-      (And($"a" === $"c", Cast($"a", IntegerType) === $"c"), "CAST(a AS INT) = outer(c)"))
+      (And($"a" === $"c", Cast($"d", IntegerType) === $"c"), "CAST(d AS INT) = outer(c)"))
     conditions.foreach { case (cond, msg) =>
       val plan = Project(
         ScalarSubquery(
@@ -849,5 +882,28 @@ class AnalysisErrorSuite extends AnalysisTest {
       t1.join(t2, condition = Some(Exists(t2.select(1).where(star("t1") === b)))),
       "Invalid usage of '*' in Filter" :: Nil
     )
+  }
+
+  test("SPARK-36488: Regular expression expansion should fail with a meaningful message") {
+    withSQLConf(SQLConf.SUPPORT_QUOTED_REGEX_COLUMN_NAME.key -> "true") {
+      assertAnalysisError(testRelation.select(Divide(UnresolvedRegex(".?", None, false), "a")),
+        s"Invalid usage of regular expression '.?' in" :: Nil)
+      assertAnalysisError(testRelation.select(
+        Divide(UnresolvedRegex(".?", None, false), UnresolvedRegex(".*", None, false))),
+        s"Invalid usage of regular expressions '.?', '.*' in" :: Nil)
+      assertAnalysisError(testRelation.select(
+        Divide(UnresolvedRegex(".?", None, false), UnresolvedRegex(".?", None, false))),
+        s"Invalid usage of regular expression '.?' in" :: Nil)
+      assertAnalysisError(testRelation.select(Divide(UnresolvedStar(None), "a")),
+        "Invalid usage of '*' in" :: Nil)
+      assertAnalysisError(testRelation.select(Divide(UnresolvedStar(None), UnresolvedStar(None))),
+        "Invalid usage of '*' in" :: Nil)
+      assertAnalysisError(testRelation.select(Divide(UnresolvedStar(None),
+        UnresolvedRegex(".?", None, false))),
+        "Invalid usage of '*' and regular expression '.?' in" :: Nil)
+      assertAnalysisError(testRelation.select(Least(Seq(UnresolvedStar(None),
+        UnresolvedRegex(".*", None, false), UnresolvedRegex(".?", None, false)))),
+        "Invalid usage of '*' and regular expressions '.*', '.?' in" :: Nil)
+    }
   }
 }

@@ -31,12 +31,12 @@ import java.sql.{Date, Timestamp}
 import java.time.{Duration, Instant, LocalDate, LocalDateTime, Period, ZoneOffset}
 import java.util
 import java.util.Objects
-import javax.xml.bind.DatatypeConverter
 
 import scala.math.{BigDecimal, BigInt}
 import scala.reflect.runtime.universe.TypeTag
 import scala.util.Try
 
+import org.apache.commons.codec.binary.{Hex => ApacheHex}
 import org.json4s.JsonAST._
 
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow, ScalaReflection}
@@ -80,7 +80,9 @@ object Literal {
     case d: Decimal => Literal(d, DecimalType(Math.max(d.precision, d.scale), d.scale))
     case i: Instant => Literal(instantToMicros(i), TimestampType)
     case t: Timestamp => Literal(DateTimeUtils.fromJavaTimestamp(t), TimestampType)
-    case l: LocalDateTime => Literal(DateTimeUtils.localDateTimeToMicros(l), TimestampNTZType)
+    // SPARK-38813: Remove TimestampNTZ type support in Spark 3.3 with minimal code changes.
+    case l: LocalDateTime if Utils.isTesting =>
+      Literal(DateTimeUtils.localDateTimeToMicros(l), TimestampNTZType)
     case ld: LocalDate => Literal(ld.toEpochDay.toInt, DateType)
     case d: Date => Literal(DateTimeUtils.fromJavaDate(d), DateType)
     case d: Duration => Literal(durationToMicros(d), DayTimeIntervalType())
@@ -120,7 +122,8 @@ object Literal {
     case _ if clz == classOf[Date] => DateType
     case _ if clz == classOf[Instant] => TimestampType
     case _ if clz == classOf[Timestamp] => TimestampType
-    case _ if clz == classOf[LocalDateTime] => TimestampNTZType
+    // SPARK-38813: Remove TimestampNTZ type support in Spark 3.3 with minimal code changes.
+    case _ if clz == classOf[LocalDateTime] && Utils.isTesting => TimestampNTZType
     case _ if clz == classOf[Duration] => DayTimeIntervalType()
     case _ if clz == classOf[Period] => YearMonthIntervalType()
     case _ if clz == classOf[JavaBigDecimal] => DecimalType.SYSTEM_DEFAULT
@@ -158,6 +161,7 @@ object Literal {
         Literal(CatalystTypeConverters.createToCatalystConverter(dataType)(v), dataType)
       case _: DayTimeIntervalType if v.isInstanceOf[Duration] =>
         Literal(CatalystTypeConverters.createToCatalystConverter(dataType)(v), dataType)
+      case _: ObjectType => Literal(v, dataType)
       case _ => Literal(CatalystTypeConverters.convertToCatalyst(v), dataType)
     }
   }
@@ -185,7 +189,8 @@ object Literal {
     case dt: DecimalType => Literal(Decimal(0, dt.precision, dt.scale))
     case DateType => create(0, DateType)
     case TimestampType => create(0L, TimestampType)
-    case TimestampNTZType => create(0L, TimestampNTZType)
+    // SPARK-38813: Remove TimestampNTZ type support in Spark 3.3 with minimal code changes.
+    case TimestampNTZType if Utils.isTesting => create(0L, TimestampNTZType)
     case it: DayTimeIntervalType => create(0L, it)
     case it: YearMonthIntervalType => create(0, it)
     case StringType => Literal("")
@@ -207,7 +212,9 @@ object Literal {
       case ByteType => v.isInstanceOf[Byte]
       case ShortType => v.isInstanceOf[Short]
       case IntegerType | DateType | _: YearMonthIntervalType => v.isInstanceOf[Int]
-      case LongType | TimestampType | TimestampNTZType | _: DayTimeIntervalType =>
+      // SPARK-38813: Remove TimestampNTZ type support in Spark 3.3 with minimal code changes.
+      case TimestampNTZType if Utils.isTesting => v.isInstanceOf[Long]
+      case LongType | TimestampType | _: DayTimeIntervalType =>
         v.isInstanceOf[Long]
       case FloatType => v.isInstanceOf[Float]
       case DoubleType => v.isInstanceOf[Double]
@@ -344,7 +351,7 @@ case class Literal (value: Any, dataType: DataType) extends LeafExpression {
 
   override def toString: String = value match {
     case null => "null"
-    case binary: Array[Byte] => s"0x" + DatatypeConverter.printHexBinary(binary)
+    case binary: Array[Byte] => s"0x" + ApacheHex.encodeHexString(binary, false)
     case d: ArrayBasedMapData => s"map(${d.toString})"
     case other =>
       dataType match {
@@ -479,7 +486,7 @@ case class Literal (value: Any, dataType: DataType) extends LeafExpression {
       s"TIMESTAMP_NTZ '$toString'"
     case (i: CalendarInterval, CalendarIntervalType) =>
       s"INTERVAL '${i.toString}'"
-    case (v: Array[Byte], BinaryType) => s"X'${DatatypeConverter.printHexBinary(v)}'"
+    case (v: Array[Byte], BinaryType) => s"X'${ApacheHex.encodeHexString(v, false)}'"
     case (i: Long, DayTimeIntervalType(startField, endField)) =>
       toDayTimeIntervalString(i, ANSI_STYLE, startField, endField)
     case (i: Int, YearMonthIntervalType(startField, endField)) =>

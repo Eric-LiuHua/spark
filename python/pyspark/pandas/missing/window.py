@@ -54,7 +54,10 @@ def _unsupported_property_rolling(property_name, deprecated=False, reason=""):
     )
 
 
-class MissingPandasLikeExpanding(object):
+class MissingPandasLikeExpanding:
+    # NOTE: Please update the document "Supported pandas APIs" when implementing the new API.
+    # Documentation path: `python/docs/source/user_guide/pandas_on_spark/supported_pandas_api.rst`.
+
     agg = _unsupported_function_expanding("agg")
     aggregate = _unsupported_function_expanding("aggregate")
     apply = _unsupported_function_expanding("apply")
@@ -72,7 +75,10 @@ class MissingPandasLikeExpanding(object):
     ndim = _unsupported_property_expanding("ndim")
 
 
-class MissingPandasLikeRolling(object):
+class MissingPandasLikeRolling:
+    # NOTE: Please update the document "Supported pandas APIs" when implementing the new API.
+    # Documentation path: `python/docs/source/user_guide/pandas_on_spark/supported_pandas_api.rst`.
+
     agg = _unsupported_function_rolling("agg")
     aggregate = _unsupported_function_rolling("aggregate")
     apply = _unsupported_function_rolling("apply")
@@ -90,7 +96,10 @@ class MissingPandasLikeRolling(object):
     ndim = _unsupported_property_rolling("ndim")
 
 
-class MissingPandasLikeExpandingGroupby(object):
+class MissingPandasLikeExpandingGroupby:
+    # NOTE: Please update the document "Supported pandas APIs" when implementing the new API.
+    # Documentation path: `python/docs/source/user_guide/pandas_on_spark/supported_pandas_api.rst`.
+
     agg = _unsupported_function_expanding("agg")
     aggregate = _unsupported_function_expanding("aggregate")
     apply = _unsupported_function_expanding("apply")
@@ -108,7 +117,10 @@ class MissingPandasLikeExpandingGroupby(object):
     ndim = _unsupported_property_expanding("ndim")
 
 
-class MissingPandasLikeRollingGroupby(object):
+class MissingPandasLikeRollingGroupby:
+    # NOTE: Please update the document "Supported pandas APIs" when implementing the new API.
+    # Documentation path: `python/docs/source/user_guide/pandas_on_spark/supported_pandas_api.rst`.
+
     agg = _unsupported_function_rolling("agg")
     aggregate = _unsupported_function_rolling("aggregate")
     apply = _unsupported_function_rolling("apply")

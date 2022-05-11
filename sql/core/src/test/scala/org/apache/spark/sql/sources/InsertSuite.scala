@@ -19,6 +19,7 @@ package org.apache.spark.sql.sources
 
 import java.io.{File, IOException}
 import java.sql.Date
+import java.time.{Duration, Period}
 
 import org.apache.hadoop.fs.{FileAlreadyExistsException, FSDataOutputStream, Path, RawLocalFileSystem}
 
@@ -27,6 +28,7 @@ import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.{CatalogStorageFormat, CatalogTable, CatalogTableType}
 import org.apache.spark.sql.catalyst.parser.ParseException
+import org.apache.spark.sql.execution.datasources.DataSourceUtils
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.PartitionOverwriteMode
 import org.apache.spark.sql.test.SharedSparkSession
@@ -711,13 +713,13 @@ class InsertSuite extends DataSourceTest with SharedSparkSession {
         var msg = intercept[SparkException] {
           sql(s"insert into t values($outOfRangeValue1)")
         }.getCause.getMessage
-        assert(msg.contains(s"Casting $outOfRangeValue1 to int causes overflow"))
+        assert(msg.contains(s"""Casting ${outOfRangeValue1}L to "INT" causes overflow"""))
 
         val outOfRangeValue2 = (Int.MinValue - 1L).toString
         msg = intercept[SparkException] {
           sql(s"insert into t values($outOfRangeValue2)")
         }.getCause.getMessage
-        assert(msg.contains(s"Casting $outOfRangeValue2 to int causes overflow"))
+        assert(msg.contains(s"""Casting ${outOfRangeValue2}L to "INT" causes overflow"""))
       }
     }
   }
@@ -731,13 +733,13 @@ class InsertSuite extends DataSourceTest with SharedSparkSession {
         var msg = intercept[SparkException] {
           sql(s"insert into t values(${outOfRangeValue1}D)")
         }.getCause.getMessage
-        assert(msg.contains(s"Casting $outOfRangeValue1 to bigint causes overflow"))
+        assert(msg.contains(s"""Casting ${outOfRangeValue1}D to "BIGINT" causes overflow"""))
 
         val outOfRangeValue2 = Math.nextDown(Long.MinValue)
         msg = intercept[SparkException] {
           sql(s"insert into t values(${outOfRangeValue2}D)")
         }.getCause.getMessage
-        assert(msg.contains(s"Casting $outOfRangeValue2 to bigint causes overflow"))
+        assert(msg.contains(s"""Casting ${outOfRangeValue2}D to "BIGINT" causes overflow"""))
       }
     }
   }
@@ -806,13 +808,15 @@ class InsertSuite extends DataSourceTest with SharedSparkSession {
 
       Seq((1, 2), (1, 3)).toDF("i", "part")
         .write.partitionBy("part").mode("overwrite")
-        .option("partitionOverwriteMode", "dynamic").parquet(path.getAbsolutePath)
+        .option(DataSourceUtils.PARTITION_OVERWRITE_MODE, PartitionOverwriteMode.DYNAMIC.toString)
+        .parquet(path.getAbsolutePath)
       checkAnswer(spark.read.parquet(path.getAbsolutePath),
         Row(1, 1) :: Row(1, 2) :: Row(1, 3) :: Nil)
 
       Seq((1, 2), (1, 3)).toDF("i", "part")
         .write.partitionBy("part").mode("overwrite")
-        .option("partitionOverwriteMode", "static").parquet(path.getAbsolutePath)
+        .option(DataSourceUtils.PARTITION_OVERWRITE_MODE, PartitionOverwriteMode.STATIC.toString)
+        .parquet(path.getAbsolutePath)
       checkAnswer(spark.read.parquet(path.getAbsolutePath), Row(1, 2) :: Row(1, 3) :: Nil)
     }
   }
@@ -919,7 +923,7 @@ class InsertSuite extends DataSourceTest with SharedSparkSession {
 
   test("SPARK-33294: Add query resolved check before analyze InsertIntoDir") {
     withTempPath { path =>
-      val msg = intercept[AnalysisException] {
+      val ex = intercept[AnalysisException] {
         sql(
           s"""
             |INSERT OVERWRITE DIRECTORY '${path.getAbsolutePath}' USING PARQUET
@@ -929,8 +933,9 @@ class InsertSuite extends DataSourceTest with SharedSparkSession {
             |  )
             |)
           """.stripMargin)
-      }.getMessage
-      assert(msg.contains("cannot resolve 'c3' given input columns"))
+      }
+      assert(ex.getErrorClass == "MISSING_COLUMN")
+      assert(ex.messageParameters.head == "c3")
     }
   }
 
@@ -1051,6 +1056,47 @@ class InsertSuite extends DataSourceTest with SharedSparkSession {
         assert(e.getMessage.contains("Failed to rename"))
         assert(e.getMessage.contains(
           "when committing files staged for overwriting dynamic partitions"))
+      }
+    }
+  }
+
+  test("SPARK-36980: Insert support query with CTE") {
+    withTable("t") {
+      sql("CREATE TABLE t(i int, part1 int, part2 int) using parquet")
+      sql("INSERT INTO t WITH v1(c1) as (values (1)) select 1, 2, 3 from v1")
+      checkAnswer(spark.table("t"), Row(1, 2, 3))
+    }
+  }
+
+  test("SPARK-37294: insert ANSI intervals into a table partitioned by the interval columns") {
+    val tbl = "interval_table"
+    Seq(PartitionOverwriteMode.DYNAMIC, PartitionOverwriteMode.STATIC).foreach { mode =>
+      withSQLConf(SQLConf.PARTITION_OVERWRITE_MODE.key -> mode.toString) {
+        withTable(tbl) {
+          sql(
+            s"""
+              |CREATE TABLE $tbl (i INT, part1 INTERVAL YEAR, part2 INTERVAL DAY) USING PARQUET
+              |PARTITIONED BY (part1, part2)
+              """.stripMargin)
+
+          sql(
+            s"""ALTER TABLE $tbl ADD PARTITION (
+               |part1 = INTERVAL '2' YEAR,
+               |part2 = INTERVAL '3' DAY)""".stripMargin)
+          sql(s"INSERT OVERWRITE TABLE $tbl SELECT 1, INTERVAL '2' YEAR, INTERVAL '3' DAY")
+          sql(s"INSERT INTO TABLE $tbl SELECT 4, INTERVAL '5' YEAR, INTERVAL '6' DAY")
+          sql(
+            s"""
+               |INSERT INTO $tbl
+               | PARTITION (part1 = INTERVAL '8' YEAR, part2 = INTERVAL '9' DAY)
+               |SELECT 7""".stripMargin)
+
+          checkAnswer(
+            spark.table(tbl),
+            Seq(Row(1, Period.ofYears(2), Duration.ofDays(3)),
+              Row(4, Period.ofYears(5), Duration.ofDays(6)),
+              Row(7, Period.ofYears(8), Duration.ofDays(9))))
+        }
       }
     }
   }

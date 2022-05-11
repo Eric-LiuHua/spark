@@ -33,6 +33,7 @@ import org.apache.spark.sql.catalyst.ScalaReflection._
 import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogStorageFormat, CatalogTable, CatalogTableType, FunctionResource}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.JoinType
+import org.apache.spark.sql.catalyst.plans.logical.TableSpec
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastMode, Partitioning}
 import org.apache.spark.sql.catalyst.rules.RuleId
 import org.apache.spark.sql.catalyst.rules.RuleIdCollection
@@ -51,9 +52,100 @@ import org.apache.spark.util.collection.BitSet
 /** Used by [[TreeNode.getNodeNumbered]] when traversing the tree for a given number */
 private class MutableInt(var i: Int)
 
+/**
+ * Contexts of TreeNodes, including location, SQL text, object type and object name.
+ * The only supported object type is "VIEW" now. In the future, we may support SQL UDF or other
+ * objects which contain SQL text.
+ */
 case class Origin(
   line: Option[Int] = None,
-  startPosition: Option[Int] = None)
+  startPosition: Option[Int] = None,
+  startIndex: Option[Int] = None,
+  stopIndex: Option[Int] = None,
+  sqlText: Option[String] = None,
+  objectType: Option[String] = None,
+  objectName: Option[String] = None) {
+
+  /**
+   * The SQL query context of current node. For example:
+   * == SQL of VIEW v1(line 1, position 25) ==
+   * SELECT '' AS five, i.f1, i.f1 - int('2') AS x FROM INT4_TBL i
+   *                          ^^^^^^^^^^^^^^^
+   */
+  lazy val context: String = {
+    // If the query context is missing or incorrect, simply return an empty string.
+    if (sqlText.isEmpty || startIndex.isEmpty || stopIndex.isEmpty ||
+      startIndex.get < 0 || stopIndex.get >= sqlText.get.length || startIndex.get > stopIndex.get) {
+      ""
+    } else {
+      val positionContext = if (line.isDefined && startPosition.isDefined) {
+        s"(line ${line.get}, position ${startPosition.get})"
+      } else {
+        ""
+      }
+      val objectContext = if (objectType.isDefined && objectName.isDefined) {
+        s" of ${objectType.get} ${objectName.get}"
+      } else {
+        ""
+      }
+      val builder = new StringBuilder
+      builder ++= s"\n== SQL$objectContext$positionContext ==\n"
+
+      val text = sqlText.get
+      val start = math.max(startIndex.get, 0)
+      val stop = math.min(stopIndex.getOrElse(text.length - 1), text.length - 1)
+      // Ideally we should show all the lines which contains the SQL text context of the current
+      // node:
+      // [additional text] [current tree node] [additional text]
+      // However, we need to truncate the additional text in case it is too long. The following
+      // variable is to define the max length of additional text.
+      val maxExtraContextLength = 32
+      val truncatedText = "..."
+      var lineStartIndex = start
+      // Collect the SQL text within the starting line of current Node.
+      // The text is truncated if it is too long.
+      while (lineStartIndex >= 0 &&
+        start - lineStartIndex <= maxExtraContextLength &&
+        text.charAt(lineStartIndex) != '\n') {
+        lineStartIndex -= 1
+      }
+      val startTruncated = start - lineStartIndex > maxExtraContextLength
+      var currentIndex = lineStartIndex
+      if (startTruncated) {
+        currentIndex -= truncatedText.length
+      }
+
+      var lineStopIndex = stop
+      // Collect the SQL text within the ending line of current Node.
+      // The text is truncated if it is too long.
+      while (lineStopIndex < text.length &&
+        lineStopIndex - stop <= maxExtraContextLength &&
+        text.charAt(lineStopIndex) != '\n') {
+        lineStopIndex += 1
+      }
+      val stopTruncated = lineStopIndex - stop > maxExtraContextLength
+
+      val truncatedSubText = (if (startTruncated) truncatedText else "") +
+        text.substring(lineStartIndex + 1, lineStopIndex) +
+        (if (stopTruncated) truncatedText else "")
+      val lines = truncatedSubText.split("\n")
+      lines.foreach { lineText =>
+        builder ++= lineText + "\n"
+        currentIndex += 1
+        (0 until lineText.length).foreach { _ =>
+          if (currentIndex < start) {
+            builder ++= " "
+          } else if (currentIndex >= start && currentIndex <= stop) {
+            builder ++= "^"
+          }
+          currentIndex += 1
+        }
+        builder ++= "\n"
+      }
+      builder.result()
+    }
+  }
+}
 
 /**
  * Provides a location for TreeNodes to ask about the context of their origin.  For example, which
@@ -246,6 +338,16 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product with Tre
   }
 
   /**
+   * Test whether there is [[TreeNode]] satisfies the conditions specified in `f`.
+   * The condition is recursively applied to this node and all of its children (pre-order).
+   */
+  def exists(f: BaseType => Boolean): Boolean = if (f(this)) {
+    true
+  } else {
+    children.exists(_.exists(f))
+  }
+
+  /**
    * Runs the given function on this node and then recursively on [[children]].
    * @param f the function to be applied to each node in the tree.
    */
@@ -340,10 +442,9 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product with Tre
   // This is a temporary solution, we will change the type of children to IndexedSeq in a
   // followup PR
   private def asIndexedSeq(seq: Seq[BaseType]): IndexedSeq[BaseType] = {
-    if (seq.isInstanceOf[IndexedSeq[BaseType]]) {
-      seq.asInstanceOf[IndexedSeq[BaseType]]
-    } else {
-      seq.toIndexedSeq
+    seq match {
+      case types: IndexedSeq[BaseType] => types
+      case other => other.toIndexedSeq
     }
   }
 
@@ -787,7 +888,7 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product with Tre
       truncatedString(seq.map(formatArg(_, maxFields)), "[", ", ", "]", maxFields)
     case set: Set[_] =>
       // Sort elements for deterministic behaviours
-      truncatedString(set.toSeq.map(formatArg(_, maxFields).sorted), "{", ", ", "}", maxFields)
+      truncatedString(set.toSeq.map(formatArg(_, maxFields)).sorted, "{", ", ", "}", maxFields)
     case array: Array[_] =>
       truncatedString(array.map(formatArg(_, maxFields)), "[", ", ", "]", maxFields)
     case other =>
@@ -802,15 +903,9 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product with Tre
     case tn: TreeNode[_] => tn.simpleString(maxFields) :: Nil
     case seq: Seq[Any] if seq.toSet.subsetOf(allChildren.asInstanceOf[Set[Any]]) => Nil
     case iter: Iterable[_] if iter.isEmpty => Nil
-    case seq: Seq[_] =>
-      truncatedString(seq.map(formatArg(_, maxFields)), "[", ", ", "]", maxFields) :: Nil
-    case set: Set[_] =>
-      // Sort elements for deterministic behaviours
-      val sortedSeq = set.toSeq.map(formatArg(_, maxFields).sorted)
-      truncatedString(sortedSeq, "{", ", ", "}", maxFields) :: Nil
     case array: Array[_] if array.isEmpty => Nil
-    case array: Array[_] =>
-      truncatedString(array.map(formatArg(_, maxFields)), "[", ", ", "]", maxFields) :: Nil
+    case xs @ (_: Seq[_] | _: Set[_] | _: Array[_]) =>
+      formatArg(xs, maxFields) :: Nil
     case null => Nil
     case None => Nil
     case Some(null) => Nil
@@ -819,6 +914,9 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product with Tre
       redactMapString(map.asCaseSensitiveMap().asScala, maxFields)
     case map: Map[_, _] =>
       redactMapString(map, maxFields)
+    case t: TableSpec =>
+      t.copy(properties = Utils.redact(t.properties).toMap,
+        options = Utils.redact(t.options).toMap) :: Nil
     case table: CatalogTable =>
       table.storage.serde match {
         case Some(serde) => table.identifier :: serde :: Nil

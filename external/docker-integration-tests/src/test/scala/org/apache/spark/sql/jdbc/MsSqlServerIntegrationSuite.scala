@@ -22,13 +22,15 @@ import java.sql.{Connection, Date, Timestamp}
 import java.util.Properties
 
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils._
+import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.tags.DockerTest
 
 /**
- * To run this test suite for a specific version (e.g., 2019-GA-ubuntu-16.04):
+ * To run this test suite for a specific version (e.g., 2019-CU13-ubuntu-20.04):
  * {{{
- *   ENABLE_DOCKER_INTEGRATION_TESTS=1 MSSQLSERVER_DOCKER_IMAGE_NAME=2019-GA-ubuntu-16.04
+ *   ENABLE_DOCKER_INTEGRATION_TESTS=1
+ *   MSSQLSERVER_DOCKER_IMAGE_NAME=mcr.microsoft.com/mssql/server:2019-CU13-ubuntu-20.04
  *     ./build/sbt -Pdocker-integration-tests
  *     "testOnly org.apache.spark.sql.jdbc.MsSqlServerIntegrationSuite"
  * }}}
@@ -37,7 +39,7 @@ import org.apache.spark.tags.DockerTest
 class MsSqlServerIntegrationSuite extends DockerJDBCIntegrationSuite {
   override val db = new DatabaseOnDocker {
     override val imageName = sys.env.getOrElse("MSSQLSERVER_DOCKER_IMAGE_NAME",
-      "mcr.microsoft.com/mssql/server:2019-GA-ubuntu-16.04")
+      "mcr.microsoft.com/mssql/server:2019-CU13-ubuntu-20.04")
     override val env = Map(
       "SA_PASSWORD" -> "Sapass123",
       "ACCEPT_EULA" -> "Y"
@@ -138,6 +140,14 @@ class MsSqlServerIntegrationSuite extends DockerJDBCIntegrationSuite {
         |'MULTILINESTRING((0 2, 1 1), (1 0, 1 1))',
         |'MULTIPOLYGON(((2 2, 2 -2, -2 -2, -2 2, 2 2)),((1 1, 3 1, 3 3, 1 3, 1 1)))',
         |'GEOMETRYCOLLECTION(LINESTRING(1 1, 3 5),POLYGON((-1 -1, -1 -5, -5 -5, -5 -1, -1 -1)))')
+      """.stripMargin).executeUpdate()
+    conn.prepareStatement(
+      """
+        |CREATE TABLE bits(a INT, b INT, c BIT)
+        |""".stripMargin).executeUpdate()
+    conn.prepareStatement(
+      """
+        |INSERT INTO bits VALUES (1, 2, 1)
       """.stripMargin).executeUpdate()
   }
 
@@ -355,5 +365,13 @@ class MsSqlServerIntegrationSuite extends DockerJDBCIntegrationSuite {
         -16, -65, 0, 0, 0, 0, 0, 0, -16, -65, 2, 0, 0, 0, 1, 0, 0, 0, 0, 2, 2, 0, 0,
         0, 3, 0, 0, 0, -1, -1, -1, -1, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0,
         0, 0, 0, 1, 0, 0, 0, 3))
+  }
+
+  test("SPARK-38889: MsSqlServerDialect should handle boolean filter push down") {
+    val df = spark.read.jdbc(jdbcUrl, "bits", new Properties)
+    val rows = df.collect()
+    assert(rows.length == 1)
+    val filtered = df.where(col("c") === 0).collect()
+    assert(filtered.length == 0)
   }
 }

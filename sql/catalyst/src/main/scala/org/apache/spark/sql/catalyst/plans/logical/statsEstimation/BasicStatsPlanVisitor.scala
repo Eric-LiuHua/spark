@@ -88,6 +88,8 @@ object BasicStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
 
   override def visitRepartitionByExpr(p: RepartitionByExpression): Statistics = fallback(p)
 
+  override def visitRebalancePartitions(p: RebalancePartitions): Statistics = fallback(p)
+
   override def visitSample(p: Sample): Statistics = fallback(p)
 
   override def visitScriptTransform(p: ScriptTransformation): Statistics = default(p)
@@ -105,4 +107,6 @@ object BasicStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
   override def visitTail(p: Tail): Statistics = {
     fallback(p)
   }
+
+  override def visitWithCTE(p: WithCTE): Statistics = fallback(p)
 }

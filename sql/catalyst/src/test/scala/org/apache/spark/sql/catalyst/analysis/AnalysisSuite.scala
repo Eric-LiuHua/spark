@@ -23,7 +23,7 @@ import scala.collection.JavaConverters._
 import scala.reflect.ClassTag
 import scala.reflect.runtime.universe.TypeTag
 
-import org.apache.log4j.Level
+import org.apache.logging.log4j.Level
 import org.scalatest.matchers.must.Matchers
 
 import org.apache.spark.api.python.PythonEvalType
@@ -100,10 +100,11 @@ class AnalysisSuite extends AnalysisTest with Matchers {
         SubqueryAlias("TbL", UnresolvedRelation(TableIdentifier("TaBlE")))),
       Project(testRelation.output, testRelation))
 
-    assertAnalysisError(
+    assertAnalysisErrorClass(
       Project(Seq(UnresolvedAttribute("tBl.a")),
         SubqueryAlias("TbL", UnresolvedRelation(TableIdentifier("TaBlE")))),
-      Seq("cannot resolve"))
+      "MISSING_COLUMN",
+      Array("tBl.a", "TbL.a"))
 
     checkAnalysisWithoutViewWrapper(
       Project(Seq(UnresolvedAttribute("TbL.a")),
@@ -220,7 +221,9 @@ class AnalysisSuite extends AnalysisTest with Matchers {
     val pl = plan.asInstanceOf[Project].projectList
 
     assert(pl(0).dataType == DoubleType)
-    assert(pl(1).dataType == DoubleType)
+    if (!SQLConf.get.ansiEnabled) {
+      assert(pl(1).dataType == DoubleType)
+    }
     assert(pl(2).dataType == DoubleType)
     assert(pl(3).dataType == DoubleType)
     assert(pl(4).dataType == DoubleType)
@@ -707,8 +710,9 @@ class AnalysisSuite extends AnalysisTest with Matchers {
   }
 
   test("CTE with non-existing column alias") {
-    assertAnalysisError(parsePlan("WITH t(x) AS (SELECT 1) SELECT * FROM t WHERE y = 1"),
-      Seq("cannot resolve 'y' given input columns: [t.x]"))
+    assertAnalysisErrorClass(parsePlan("WITH t(x) AS (SELECT 1) SELECT * FROM t WHERE y = 1"),
+      "MISSING_COLUMN",
+      Array("y", "t.x"))
   }
 
   test("CTE with non-matching column alias") {
@@ -844,7 +848,7 @@ class AnalysisSuite extends AnalysisTest with Matchers {
         assert(logAppender.loggingEvents.size == count)
         assert(logAppender.loggingEvents.exists(
           e => e.getLevel == Level.WARN &&
-            e.getRenderedMessage.contains(message)))
+            e.getMessage.getFormattedMessage.contains(message)))
       }
 
       withLogAppender(logAppender) {
@@ -921,23 +925,28 @@ class AnalysisSuite extends AnalysisTest with Matchers {
 
     assertAnalysisError(r1,
       Seq("Union can only be performed on tables with the compatible column types. " +
-        "timestamp <> double at the second column of the second table"))
+        "The second column of the second table is timestamp type which is not compatible " +
+        "with double at same column of first table"))
 
     assertAnalysisError(r2,
       Seq("Union can only be performed on tables with the compatible column types. " +
-        "timestamp <> int at the third column of the second table"))
+        "The third column of the second table is timestamp type which is not compatible " +
+        "with int at same column of first table"))
 
     assertAnalysisError(r3,
       Seq("Union can only be performed on tables with the compatible column types. " +
-        "timestamp <> float at the 4th column of the second table"))
+        "The 4th column of the second table is timestamp type which is not compatible " +
+        "with float at same column of first table"))
 
     assertAnalysisError(r4,
       Seq("Except can only be performed on tables with the compatible column types. " +
-        "timestamp <> double at the second column of the second table"))
+        "The second column of the second table is timestamp type which is not compatible " +
+        "with double at same column of first table"))
 
     assertAnalysisError(r5,
       Seq("Intersect can only be performed on tables with the compatible column types. " +
-        "timestamp <> double at the second column of the second table"))
+        "The second column of the second table is timestamp type which is not compatible " +
+        "with double at same column of first table"))
   }
 
   test("SPARK-31975: Throw user facing error when use WindowFunction directly") {
@@ -952,7 +961,7 @@ class AnalysisSuite extends AnalysisTest with Matchers {
   }
 
   test("SPARK-32237: Hint in CTE") {
-    val plan = With(
+    val plan = UnresolvedWith(
       Project(
         Seq(UnresolvedAttribute("cte.a")),
         UnresolvedRelation(TableIdentifier("cte"))
@@ -1133,12 +1142,38 @@ class AnalysisSuite extends AnalysisTest with Matchers {
         |ORDER BY c.x
         |""".stripMargin))
 
-    assertAnalysisError(parsePlan(
+    assertAnalysisErrorClass(parsePlan(
      """
         |SELECT c.x
         |FROM VALUES NAMED_STRUCT('x', 'A', 'y', 1), NAMED_STRUCT('x', 'A', 'y', 2) AS t(c)
         |GROUP BY c.x
         |ORDER BY c.x + c.y
-        |""".stripMargin), "cannot resolve 'c.y' given input columns: [x]" :: Nil)
+        |""".stripMargin),
+      "MISSING_COLUMN",
+      Array("c.y", "x"))
+  }
+
+  test("SPARK-38118: Func(wrong_type) in the HAVING clause should throw data mismatch error") {
+    Seq("mean", "abs").foreach { func =>
+      assertAnalysisError(parsePlan(
+        s"""
+           |WITH t as (SELECT true c)
+           |SELECT t.c
+           |FROM t
+           |GROUP BY t.c
+           |HAVING ${func}(t.c) > 0d""".stripMargin),
+        Seq(s"cannot resolve '$func(t.c)' due to data type mismatch"),
+        false)
+
+      assertAnalysisError(parsePlan(
+        s"""
+           |WITH t as (SELECT true c, false d)
+           |SELECT (t.c AND t.d) c
+           |FROM t
+           |GROUP BY t.c
+           |HAVING ${func}(c) > 0d""".stripMargin),
+        Seq(s"cannot resolve '$func(t.c)' due to data type mismatch"),
+        false)
+    }
   }
 }
